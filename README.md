@@ -162,6 +162,10 @@ Start the Streamlit UI:
 streamlit run app/ui.py
 ```
 
+UI preview:
+
+![AI Codebase Assistant UI](assets/ui_preview.png)
+
 ## Example questions
 
 - Which file contains argparse and the main function?
