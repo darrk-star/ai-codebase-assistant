@@ -2,6 +2,13 @@
 
 A local codebase Q&A assistant built with LangChain, LlamaIndex, and Ollama.
 
+## Overview
+
+- local-first repository Q&A with no external API key requirement
+- built for engineering onboarding, repository exploration, and code search
+- combines vector retrieval with code-aware heuristics for better file-level answers
+- supports both CLI usage and a Streamlit chat UI
+
 This project is designed for a common engineering problem:
 - a code repository is too large for new contributors to understand quickly
 - source code, docs, and configuration are spread across many files
@@ -11,6 +18,26 @@ This project is designed for a common engineering problem:
   - How is the weekly digest generated?
 
 This assistant indexes a local repository, retrieves relevant code and documents, and answers natural language questions with cited source files.
+
+## UI preview
+
+![AI Codebase Assistant UI](assets/ui_preview.png)
+
+## Demo flow
+
+1. Select a local repository path in the Streamlit UI.
+2. Click `Build / Load Index` to create or reuse the persisted vector index.
+3. Ask a repository question in natural language.
+4. Review the answer together with cited source file paths.
+
+## Demo questions and outcomes
+
+| Question | Expected outcome |
+| --- | --- |
+| `Which file contains argparse and the main function?` | identifies `app/main.py` |
+| `Which file fetches GitHub workflow runs?` | points to the GitHub client implementation |
+| `Where are CI charts generated?` | surfaces the chart generation module |
+| `How is the weekly digest built?` | explains the reporting flow and relevant files |
 
 ## Why this project
 
@@ -162,10 +189,6 @@ Start the Streamlit UI:
 streamlit run app/ui.py
 ```
 
-UI preview:
-
-![AI Codebase Assistant UI](assets/ui_preview.png)
-
 ## Example questions
 
 - Which file contains argparse and the main function?
@@ -194,6 +217,24 @@ and surfaced supporting evidence such as:
 
 This is important because it demonstrates that the system is not only returning approximate matches; it can be tuned toward code-structure questions with better retrieval logic.
 
+## Sample interaction
+
+```text
+User:
+Which file contains argparse and the main function?
+
+Assistant:
+The file is app/main.py.
+
+Why:
+- it imports argparse
+- it defines def main() -> None
+- it contains the CLI entry flow
+
+Sources:
+- app/main.py
+```
+
 ## Engineering highlights
 
 - local-first AI workflow with no external API key requirement
@@ -209,6 +250,13 @@ This is important because it demonstrates that the system is not only returning 
 - add repository filters by directory or file type
 - support multiple repositories
 - add follow-up question memory beyond single-session UI state
+
+## Best fit use cases
+
+- onboarding into an unfamiliar repository
+- locating entrypoints and ownership hotspots
+- tracing where reports, charts, workflows, or APIs are implemented
+- building an internal developer support assistant on top of local code
 
 ## Resume-ready description
 
