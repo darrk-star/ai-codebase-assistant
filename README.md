@@ -156,6 +156,12 @@ Start interactive mode:
 python -m app.main --repo-path C:\path\to\repo ask
 ```
 
+Start the Streamlit UI:
+
+```powershell
+streamlit run app/ui.py
+```
+
 ## Example questions
 
 - Which file contains argparse and the main function?
@@ -190,15 +196,15 @@ This is important because it demonstrates that the system is not only returning 
 - persisted repository index for repeated querying
 - source citation in answers
 - retrieval tuning for code-oriented questions
+- minimal web UI with Streamlit
 - clear modular separation between loading, indexing, retrieval, and generation
 
 ## Good next extensions
 
-- add Streamlit or Gradio UI
 - support GitHub Issues and PR comments as extra context
 - add repository filters by directory or file type
 - support multiple repositories
-- add chat history and follow-up question memory
+- add follow-up question memory beyond single-session UI state
 
 ## Resume-ready description
 
