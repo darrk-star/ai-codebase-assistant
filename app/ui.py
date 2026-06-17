@@ -22,80 +22,86 @@ def main() -> None:
     _init_session_state()
 
     default_repo = str((Path(__file__).resolve().parents[2] / "github-efficiency-analyzer").resolve())
-    left_col, right_col = st.columns([1, 2], gap="large")
     repo_path = Path(default_repo).resolve()
 
-    with left_col:
-        st.subheader("Workspace")
+    st.markdown("### Workspace")
+    top_left, top_right = st.columns([2, 1], gap="large")
+
+    with top_left:
         repo_input = st.text_input("Repository path", value=default_repo)
         repo_path = Path(repo_input).resolve()
         rebuild = st.checkbox("Rebuild index", value=False)
 
-        if st.button("Build / Load Index", use_container_width=True, type="primary"):
-            try:
-                with st.spinner("Preparing index..."):
-                    index = build_or_load_index(repo_path=repo_path, config=config, rebuild=rebuild)
-                st.session_state["index"] = index
-                st.session_state["repo_path"] = repo_path
-                st.success(f"Index ready at: {config.resolve_index_dir(repo_path)}")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Failed to prepare index: {exc}")
+        action_col1, action_col2 = st.columns([2, 1])
+        with action_col1:
+            if st.button("Build / Load Index", use_container_width=True, type="primary"):
+                try:
+                    with st.spinner("Preparing index..."):
+                        index = build_or_load_index(repo_path=repo_path, config=config, rebuild=rebuild)
+                    st.session_state["index"] = index
+                    st.session_state["repo_path"] = repo_path
+                    st.success(f"Index ready at: {config.resolve_index_dir(repo_path)}")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Failed to prepare index: {exc}")
+        with action_col2:
+            if st.button("Clear chat", use_container_width=True):
+                st.session_state["messages"] = []
+                st.rerun()
 
-        st.markdown("### Models")
-        st.write(f"Chat: `{config.chat_model}`")
-        st.write(f"Embedding: `{config.embedding_model}`")
+    with top_right:
+        metric_col1, metric_col2 = st.columns(2)
+        metric_col1.metric("Chat model", config.chat_model)
+        metric_col2.metric("Embedding model", config.embedding_model)
 
-        st.markdown("### Suggested questions")
+    st.markdown("### Suggested questions")
+    q_col1, q_col2 = st.columns(2, gap="large")
+    with q_col1:
         st.code("Which file contains argparse and the main function?")
         st.code("Which file fetches GitHub workflow runs?")
+    with q_col2:
         st.code("Where are CI charts generated?")
         st.code("How is the weekly digest built?")
 
-        if st.button("Clear chat history", use_container_width=True):
-            st.session_state["messages"] = []
-            st.rerun()
+    st.markdown("### Conversation")
 
-    with right_col:
-        st.subheader("Conversation")
+    if "index" not in st.session_state:
+        st.info("Build or load an index first.")
+        return
 
-        if "index" not in st.session_state:
-            st.info("Build or load an index first.")
-            return
+    _render_messages()
+    question = st.chat_input("Ask a question about the repository")
 
-        _render_messages()
-        question = st.chat_input("Ask a question about the repository")
-
-        if question:
-            st.session_state["messages"].append(
-                {
-                    "role": "user",
-                    "content": question,
-                }
-            )
-            with st.spinner("Thinking..."):
-                try:
-                    result = answer_question(
-                        index=st.session_state["index"],
-                        question=question,
-                        config=config,
-                        repo_path=st.session_state["repo_path"],
-                    )
-                    st.session_state["messages"].append(
-                        {
-                            "role": "assistant",
-                            "content": result.answer,
-                            "sources": result.sources,
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    st.session_state["messages"].append(
-                        {
-                            "role": "assistant",
-                            "content": f"Failed to answer question: {exc}",
-                            "sources": [],
-                        }
-                    )
-            st.rerun()
+    if question:
+        st.session_state["messages"].append(
+            {
+                "role": "user",
+                "content": question,
+            }
+        )
+        with st.spinner("Thinking..."):
+            try:
+                result = answer_question(
+                    index=st.session_state["index"],
+                    question=question,
+                    config=config,
+                    repo_path=st.session_state["repo_path"],
+                )
+                st.session_state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": result.answer,
+                        "sources": result.sources,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": f"Failed to answer question: {exc}",
+                        "sources": [],
+                    }
+                )
+        st.rerun()
 
 
 def _init_session_state() -> None:
