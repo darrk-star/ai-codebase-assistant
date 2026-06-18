@@ -49,6 +49,9 @@ class AnswerResult:
     sources: list[str]
     search_question: str
     evidence: list[dict[str, str]]
+    confidence_label: str
+    confidence_score: int
+    risk_note: str
 
 
 def answer_question(
@@ -125,6 +128,9 @@ def answer_question(
         sources=source_paths,
         search_question=search_question,
         evidence=evidence_blocks[:5],
+        confidence_label=_confidence_label(source_paths, evidence_blocks, question, search_question),
+        confidence_score=_confidence_score(source_paths, evidence_blocks, question, search_question),
+        risk_note=_risk_note(source_paths, evidence_blocks, question, search_question),
     )
 
 
@@ -264,3 +270,72 @@ def _trim_snippet(text: str, limit: int = 500) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return f"{cleaned[:limit].rstrip()}..."
+
+
+def _confidence_score(
+    source_paths: list[str],
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+    search_question: str,
+) -> int:
+    score = 45
+    question_lower = question.lower()
+    search_lower = search_question.lower()
+
+    if evidence_blocks:
+        score += min(len(evidence_blocks), 3) * 8
+    if source_paths:
+        score += 8
+    if len(source_paths) == 1:
+        score += 10
+    if any(item.get("reason") == "Keyword-based code match" for item in evidence_blocks):
+        score += 12
+
+    if any(keyword in search_lower for keyword in ("entrypoint", "main", "cli", "command")):
+        if any("main.py" in path.lower() for path in source_paths):
+            score += 10
+
+    if any(keyword in question_lower for keyword in ("which file", "where")):
+        if source_paths:
+            score += 5
+
+    if len(source_paths) >= 4:
+        score -= 10
+    if not evidence_blocks:
+        score -= 15
+
+    return max(0, min(100, score))
+
+
+def _confidence_label(
+    source_paths: list[str],
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+    search_question: str,
+) -> str:
+    score = _confidence_score(source_paths, evidence_blocks, question, search_question)
+    if score >= 80:
+        return "High confidence"
+    if score >= 60:
+        return "Medium confidence"
+    return "Low confidence"
+
+
+def _risk_note(
+    source_paths: list[str],
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+    search_question: str,
+) -> str:
+    score = _confidence_score(source_paths, evidence_blocks, question, search_question)
+    search_lower = search_question.lower()
+
+    if score >= 80:
+        return "The answer is backed by focused matches and is likely reliable for this repository question."
+    if any(keyword in search_lower for keyword in ("flow", "interaction", "across files", "call chain", "called")):
+        return "This answer may miss runtime behavior or cross-file interactions because the assistant relies on retrieved code snippets, not full program execution."
+    if len(source_paths) >= 4:
+        return "The answer pulled in several files, so treat it as a best-effort summary and verify the cited sources."
+    if not evidence_blocks:
+        return "The answer has weak retrieval support. Check the cited files before relying on it."
+    return "The answer is plausible, but you should still verify the cited files for edge cases or missing context."

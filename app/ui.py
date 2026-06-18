@@ -99,6 +99,9 @@ def main() -> None:
                         "sources": result.sources,
                         "search_question": result.search_question,
                         "evidence": result.evidence,
+                        "confidence_label": result.confidence_label,
+                        "confidence_score": result.confidence_score,
+                        "risk_note": result.risk_note,
                     }
                 )
             except Exception as exc:  # noqa: BLE001
@@ -109,6 +112,9 @@ def main() -> None:
                         "sources": [],
                         "search_question": "",
                         "evidence": [],
+                        "confidence_label": "Low confidence",
+                        "confidence_score": 0,
+                        "risk_note": "The assistant failed to answer the question, so no reliable confidence estimate is available.",
                     }
                 )
         st.rerun()
@@ -128,6 +134,20 @@ def _render_messages() -> None:
             st.write(message["content"])
             search_question = message.get("search_question", "").strip()
             evidence = message.get("evidence") or []
+            confidence_label = message.get("confidence_label", "").strip()
+            confidence_score = message.get("confidence_score", 0)
+            risk_note = message.get("risk_note", "").strip()
+
+            if confidence_label:
+                if confidence_score >= 80:
+                    st.success(f"{confidence_label} ({confidence_score}/100)")
+                elif confidence_score >= 60:
+                    st.warning(f"{confidence_label} ({confidence_score}/100)")
+                else:
+                    st.error(f"{confidence_label} ({confidence_score}/100)")
+
+            if risk_note:
+                st.caption(risk_note)
 
             if search_question:
                 with st.expander("How the assistant searched"):
