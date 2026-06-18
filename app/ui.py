@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import streamlit as st
 from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import AppConfig
 from app.indexing import build_or_load_index
@@ -85,12 +90,15 @@ def main() -> None:
                     question=question,
                     config=config,
                     repo_path=st.session_state["repo_path"],
+                    history=st.session_state["messages"],
                 )
                 st.session_state["messages"].append(
                     {
                         "role": "assistant",
                         "content": result.answer,
                         "sources": result.sources,
+                        "search_question": result.search_question,
+                        "evidence": result.evidence,
                     }
                 )
             except Exception as exc:  # noqa: BLE001
@@ -99,6 +107,8 @@ def main() -> None:
                         "role": "assistant",
                         "content": f"Failed to answer question: {exc}",
                         "sources": [],
+                        "search_question": "",
+                        "evidence": [],
                     }
                 )
         st.rerun()
@@ -116,6 +126,21 @@ def _render_messages() -> None:
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
             st.write(message["content"])
+            search_question = message.get("search_question", "").strip()
+            evidence = message.get("evidence") or []
+
+            if search_question:
+                with st.expander("How the assistant searched"):
+                    st.caption("Rewritten retrieval question")
+                    st.code(search_question)
+
+            if evidence:
+                with st.expander("Why these files were selected"):
+                    for item in evidence:
+                        st.markdown(f"**{item['file_path']}**")
+                        st.caption(item["reason"])
+                        st.code(item["snippet"])
+
             sources = message.get("sources") or []
             if sources:
                 with st.expander("Sources"):

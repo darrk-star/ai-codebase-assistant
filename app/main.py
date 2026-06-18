@@ -82,13 +82,33 @@ def _handle_question(index, question: str, config: AppConfig, repo_path: Path) -
 
 def _interactive_loop(index, config: AppConfig, repo_path: Path) -> None:
     print("Interactive mode started. Type 'exit' to quit.")
+    history: list[dict[str, str]] = []
     while True:
         question = input("\nQuestion> ").strip()
         if question.lower() in {"exit", "quit"}:
             break
         if not question:
             continue
-        _handle_question(index, question, config, repo_path)
+        result = answer_question(
+            index=index,
+            question=question,
+            config=config,
+            repo_path=repo_path,
+            history=history,
+        )
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": result.answer})
+        print("\nAnswer:\n")
+        print(result.answer)
+        print("\nSearch question:")
+        print(result.search_question)
+        if result.evidence:
+            print("\nEvidence:")
+            for item in result.evidence:
+                print(f"- {item['file_path']} ({item['reason']})")
+        print("\nSources:")
+        for source in result.sources:
+            print(f"- {source}")
 
 
 if __name__ == "__main__":

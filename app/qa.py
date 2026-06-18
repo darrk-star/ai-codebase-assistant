@@ -17,11 +17,27 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             "You are a codebase assistant. Answer only from the provided repository context. "
-            "If the context is insufficient, say so clearly. Cite relevant file paths in your answer.",
+            "If the context is insufficient, say so clearly. Use the recent conversation only to resolve "
+            "references such as 'it', 'that file', or follow-up questions. Cite relevant file paths in your answer.",
         ),
         (
             "human",
-            "Question:\n{question}\n\nRepository context:\n{context}",
+            "Recent conversation:\n{history}\n\nQuestion:\n{question}\n\nRepository context:\n{context}",
+        ),
+    ]
+)
+
+QUERY_REWRITE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Rewrite the latest user question into a standalone repository-search question. "
+            "Use the recent conversation only to resolve missing references. "
+            "Return only the rewritten question.",
+        ),
+        (
+            "human",
+            "Recent conversation:\n{history}\n\nLatest question:\n{question}",
         ),
     ]
 )
@@ -31,6 +47,8 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
 class AnswerResult:
     answer: str
     sources: list[str]
+    search_question: str
+    evidence: list[dict[str, str]]
 
 
 def answer_question(
@@ -38,18 +56,41 @@ def answer_question(
     question: str,
     config: AppConfig,
     repo_path: Path,
+    history: list[dict[str, str]] | None = None,
 ) -> AnswerResult:
+    history = history or []
+    llm = ChatOllama(
+        model=config.chat_model,
+        base_url=config.ollama_base_url,
+        temperature=0,
+    )
+
+    search_question = _rewrite_question(
+        question=question,
+        history=history,
+        llm=llm,
+    )
+
     retriever = index.as_retriever(similarity_top_k=config.top_k)
-    nodes = retriever.retrieve(question)
-    nodes = _rerank_nodes(question=question, nodes=nodes)
+    nodes = retriever.retrieve(search_question)
+    nodes = _rerank_nodes(question=search_question, nodes=nodes)
 
     source_paths: list[str] = []
     context_blocks: list[str] = []
+    evidence_blocks: list[dict[str, str]] = []
+    history_text = _format_history(history)
 
-    keyword_context_blocks = _collect_keyword_contexts(repo_path=repo_path, question=question)
+    keyword_context_blocks = _collect_keyword_contexts(repo_path=repo_path, question=search_question)
     for file_path, snippet in keyword_context_blocks:
         if file_path not in source_paths:
             source_paths.append(file_path)
+        evidence_blocks.append(
+            {
+                "file_path": file_path,
+                "reason": "Keyword-based code match",
+                "snippet": snippet,
+            }
+        )
         context_blocks.append(f"File: {file_path}\n{snippet}")
 
     for node in nodes:
@@ -57,26 +98,65 @@ def answer_question(
         file_path = metadata.get("file_path", "unknown")
         if file_path not in source_paths:
             source_paths.append(file_path)
+        if not any(item["file_path"] == file_path for item in evidence_blocks):
+            evidence_blocks.append(
+                {
+                    "file_path": str(file_path),
+                    "reason": "Vector retrieval result",
+                    "snippet": _trim_snippet(node.text.strip()),
+                }
+            )
         context_blocks.append(
             f"File: {file_path}\n{node.text.strip()}"
         )
 
     context = "\n\n---\n\n".join(context_blocks) if context_blocks else "No context found."
 
-    llm = ChatOllama(
-        model=config.chat_model,
-        base_url=config.ollama_base_url,
-        temperature=0,
-    )
-
     response = (ANSWER_PROMPT | llm).invoke(
         {
+            "history": history_text,
             "question": question,
             "context": context,
         }
     )
 
-    return AnswerResult(answer=response.content, sources=source_paths)
+    return AnswerResult(
+        answer=response.content,
+        sources=source_paths,
+        search_question=search_question,
+        evidence=evidence_blocks[:5],
+    )
+
+
+def _rewrite_question(question: str, history: list[dict[str, str]], llm: ChatOllama) -> str:
+    history_text = _format_history(history)
+    if history_text == "No prior conversation.":
+        return question
+
+    response = (QUERY_REWRITE_PROMPT | llm).invoke(
+        {
+            "history": history_text,
+            "question": question,
+        }
+    )
+    rewritten = str(response.content).strip()
+    return rewritten or question
+
+
+def _format_history(history: list[dict[str, str]], max_turns: int = 6) -> str:
+    if not history:
+        return "No prior conversation."
+
+    recent_messages = history[-max_turns:]
+    lines: list[str] = []
+    for message in recent_messages:
+        role = message.get("role", "user").capitalize()
+        content = message.get("content", "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content}")
+
+    return "\n".join(lines) if lines else "No prior conversation."
 
 
 def _rerank_nodes(question: str, nodes: list[Any]) -> list[Any]:
@@ -177,3 +257,10 @@ def _extract_best_snippet(text: str, patterns: tuple[str, ...]) -> str:
             end = min(len(text), index + 900)
             return text[start:end].strip()
     return text[:1200].strip()
+
+
+def _trim_snippet(text: str, limit: int = 500) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit].rstrip()}..."
