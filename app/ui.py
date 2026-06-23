@@ -18,6 +18,18 @@ from app.qa import answer_question
 load_dotenv()
 
 
+SUGGESTED_QUESTIONS = (
+    "How is the weekly digest built?",
+    "How is the summary report built?",
+    "Where is the Ollama base URL configured?",
+    "Which file contains argparse and the main function?",
+    "What calls compute_digest across files?",
+    "Which file fetches GitHub workflow runs and where are they summarized?",
+    "Where are CI charts generated?",
+    "What design risks do you see in this project?",
+)
+
+
 def main() -> None:
     st.set_page_config(page_title="AI Codebase Assistant", page_icon=":books:", layout="wide")
     st.title("AI Codebase Assistant")
@@ -44,11 +56,21 @@ def main() -> None:
         )
         repo_input = st.text_input("Repository path", key="repo_input_value")
         repo_path = Path(repo_input).resolve()
+        repo_ready, repo_status_message = _validate_repo_path(repo_path)
+        index_dir = config.resolve_index_dir(repo_path)
+        persisted_index_exists = index_dir.exists()
         rebuild = st.checkbox("Rebuild index", value=False)
+
+        if repo_ready:
+            st.caption(f"Repository found: {repo_path}")
+        else:
+            st.error(repo_status_message)
+        st.caption(f"Index directory: {index_dir}")
+        st.caption(f"Persisted index on disk: {'Yes' if persisted_index_exists else 'No'}")
 
         action_col1, action_col2, action_col3 = st.columns([2, 1, 1])
         with action_col1:
-            if st.button("Build / Load Index", use_container_width=True, type="primary"):
+            if st.button("Build / Load Index", use_container_width=True, type="primary", disabled=not repo_ready):
                 try:
                     with st.spinner("Preparing index..."):
                         index = build_or_load_index(repo_path=repo_path, config=config, rebuild=rebuild)
@@ -57,14 +79,14 @@ def main() -> None:
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Failed to prepare index: {exc}")
         with action_col2:
-            if st.button("Clear chat", use_container_width=True):
+            if st.button("Clear chat", use_container_width=True, disabled=not _get_workspace(repo_path)["messages"]):
                 workspace = _get_workspace(repo_path)
                 workspace["messages"] = []
                 st.session_state["workspaces"][_repo_key(repo_path)] = workspace
                 st.session_state["active_repo_key"] = _repo_key(repo_path)
                 st.rerun()
         with action_col3:
-            if st.button("Save workspace", use_container_width=True):
+            if st.button("Save workspace", use_container_width=True, disabled=not repo_ready):
                 workspace = _get_workspace(repo_path)
                 st.session_state["workspaces"][_repo_key(repo_path)] = workspace
                 if _repo_key(repo_path) not in st.session_state["workspace_order"]:
@@ -81,66 +103,36 @@ def main() -> None:
         st.caption(f"Saved workspaces: {len(st.session_state['workspace_order'])}")
         current_workspace = _get_workspace(repo_path)
         st.caption(f"Index ready: {'Yes' if current_workspace['index'] is not None else 'No'}")
+        st.caption(f"Persisted index: {'Yes' if config.resolve_index_dir(repo_path).exists() else 'No'}")
         st.caption(f"Messages in this workspace: {len(current_workspace['messages'])}")
 
     workspace = _get_workspace(repo_path)
 
     st.markdown("### Suggested questions")
     q_col1, q_col2 = st.columns(2, gap="large")
-    with q_col1:
-        if st.button(
-            "Which file contains argparse and the main function?",
-            use_container_width=True,
-            key="suggest_q_main",
-        ):
-            _submit_suggested_question(
-                "Which file contains argparse and the main function?",
-                workspace,
-                repo_path,
-                config,
-            )
-        if st.button(
-            "Which file fetches GitHub workflow runs?",
-            use_container_width=True,
-            key="suggest_q_workflow_runs",
-        ):
-            _submit_suggested_question(
-                "Which file fetches GitHub workflow runs?",
-                workspace,
-                repo_path,
-                config,
-            )
-    with q_col2:
-        if st.button(
-            "Where are CI charts generated?",
-            use_container_width=True,
-            key="suggest_q_charts",
-        ):
-            _submit_suggested_question(
-                "Where are CI charts generated?",
-                workspace,
-                repo_path,
-                config,
-            )
-        if st.button(
-            "How is the weekly digest built?",
-            use_container_width=True,
-            key="suggest_q_digest",
-        ):
-            _submit_suggested_question(
-                "How is the weekly digest built?",
-                workspace,
-                repo_path,
-                config,
-            )
+    for idx, question in enumerate(SUGGESTED_QUESTIONS):
+        target_column = q_col1 if idx % 2 == 0 else q_col2
+        with target_column:
+            if st.button(
+                question,
+                use_container_width=True,
+                key=f"suggest_q_{idx}",
+                disabled=workspace["index"] is None,
+            ):
+                _submit_suggested_question(
+                    question,
+                    workspace,
+                    repo_path,
+                    config,
+                )
 
     st.markdown("### Conversation")
 
     if workspace["index"] is None:
-        st.info("Build or load an index first.")
+        st.info("Build or load an index first. Once the index is ready, suggested questions and chat input will become available.")
         return
 
-    st.info("Current limitation: this version runs each question synchronously. Once answering starts, there is no true in-page cancel button yet.")
+    st.caption("Questions run synchronously in the current page session. For config or model changes, stop and restart Streamlit.")
 
     _render_messages(workspace["messages"])
     question = st.chat_input("Ask a question about the repository")
@@ -168,6 +160,7 @@ def _render_messages(messages: list[dict[str, object]]) -> None:
             st.write(message["content"])
             search_question = message.get("search_question", "").strip()
             evidence = message.get("evidence") or []
+            call_chain_summary = message.get("call_chain_summary", "").strip()
             confidence_label = message.get("confidence_label", "").strip()
             confidence_score = message.get("confidence_score", 0)
             risk_note = message.get("risk_note", "").strip()
@@ -182,6 +175,10 @@ def _render_messages(messages: list[dict[str, object]]) -> None:
 
             if risk_note:
                 st.caption(risk_note)
+
+            if call_chain_summary:
+                with st.expander("Cross-file relationships"):
+                    st.markdown(call_chain_summary)
 
             if search_question:
                 with st.expander("How the assistant searched"):
@@ -244,6 +241,25 @@ def _submit_suggested_question(
     repo_path: Path,
     config: AppConfig,
 ) -> None:
+    if workspace["index"] is None:
+        workspace["messages"].append(
+            {
+                "role": "assistant",
+                "content": "Index is not ready yet. Click `Build / Load Index` before asking a question.",
+                "sources": [],
+                "search_question": "",
+                "evidence": [],
+                "call_chain_summary": "",
+                "confidence_label": "Low confidence",
+                "confidence_score": 0,
+                "risk_note": "No repository index is loaded in the current workspace, so the assistant cannot answer reliably yet.",
+            }
+        )
+        st.session_state["workspaces"][_repo_key(repo_path)] = workspace
+        st.session_state["active_repo_key"] = _repo_key(repo_path)
+        st.rerun()
+        return
+
     workspace["messages"].append(
         {
             "role": "user",
@@ -266,6 +282,7 @@ def _submit_suggested_question(
                     "sources": result.sources,
                     "search_question": result.search_question,
                     "evidence": result.evidence,
+                    "call_chain_summary": getattr(result, "call_chain_summary", ""),
                     "confidence_label": result.confidence_label,
                     "confidence_score": result.confidence_score,
                     "risk_note": result.risk_note,
@@ -279,6 +296,7 @@ def _submit_suggested_question(
                     "sources": [],
                     "search_question": "",
                     "evidence": [],
+                    "call_chain_summary": "",
                     "confidence_label": "Low confidence",
                     "confidence_score": 0,
                     "risk_note": "The assistant failed to answer the question, so no reliable confidence estimate is available.",
@@ -294,6 +312,14 @@ def _handle_workspace_change() -> None:
     if selected_workspace:
         st.session_state["active_repo_key"] = selected_workspace
         st.session_state["repo_input_value"] = selected_workspace
+
+
+def _validate_repo_path(repo_path: Path) -> tuple[bool, str]:
+    if not repo_path.exists():
+        return False, "Repository path does not exist yet."
+    if not repo_path.is_dir():
+        return False, "Repository path must point to a folder."
+    return True, ""
 
 
 if __name__ == "__main__":

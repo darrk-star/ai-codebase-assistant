@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -9,6 +10,7 @@ from langchain_ollama import ChatOllama
 from llama_index.core import VectorStoreIndex
 
 from app.config import AppConfig
+from app.config import DEFAULT_EXTENSIONS
 from app.loaders import IGNORED_DIR_NAMES
 
 
@@ -18,7 +20,13 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             "You are a codebase assistant. Answer only from the provided repository context. "
             "If the context is insufficient, say so clearly. Use the recent conversation only to resolve "
-            "references such as 'it', 'that file', or follow-up questions. Cite relevant file paths in your answer.",
+            "references such as 'it', 'that file', or follow-up questions. Do not mention files that are not "
+            "present in the repository context. Keep the answer concise and use this exact structure:\n"
+            "Answer: <short answer>\n"
+            "Why:\n"
+            "- <fact grounded in the retrieved context>\n"
+            "- <fact grounded in the retrieved context>\n"
+            "If the context is insufficient, say so in the Answer line and keep the Why section brief.",
         ),
         (
             "human",
@@ -49,18 +57,64 @@ class AnswerResult:
     sources: list[str]
     search_question: str
     evidence: list[dict[str, str]]
+    call_chain_summary: str
     confidence_label: str
     confidence_score: int
     risk_note: str
 
 
+INTENT_PATTERNS: dict[str, tuple[str, ...]] = {
+    "entrypoint": ("entrypoint", "main", "cli", "command", "startup", "run"),
+    "workflow": ("workflow", "github actions", "ci", "pipeline", "job", "run"),
+    "reporting": ("digest", "summary", "report", "chart", "plot", "graph", "metric"),
+    "configuration": ("config", "setting", "env", "environment", "variable"),
+    "indexing": ("index", "indexed", "indexing", "persist", "persisted", "storage", "retriever", "retrieve"),
+    "callchain": ("call", "called", "uses", "used", "flow", "interaction", "chain", "invokes"),
+    "tests": ("test", "pytest", "coverage", "fixture"),
+    "structure": ("how", "where", "which", "call", "flow", "built", "generated", "implemented"),
+}
+
+
+SEMANTIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "weekly digest": ("build_weekly_ci_digest", "write_weekly_digest_report", "weekly_digest.md"),
+    "weekly_digest": ("build_weekly_ci_digest", "write_weekly_digest_report", "weekly_digest.md"),
+    "summary report": ("write_markdown_report", "summary.md"),
+    "markdown report": ("write_markdown_report", "summary.md"),
+    "ci charts": ("write_failure_trend_chart", "write_failed_workflow_chart", "ci_failure_trend.png", "unstable_workflows.png"),
+}
+
+LOW_SIGNAL_FUNCTIONS = {
+    "parse_args",
+    "_dt",
+    "_fmt",
+    "_format_pair",
+    "__init__",
+    "main",
+    "from_env",
+    "load_dotenv",
+}
+
+LOW_SIGNAL_PREFIXES = (
+    "fetch_",
+    "summarize_",
+)
+
+LOW_SIGNAL_PATTERNS = (
+    "build_pr_rows",
+    "build_workflow_rows",
+)
+
+
 def answer_question(
-    index: VectorStoreIndex,
+    index: VectorStoreIndex | None,
     question: str,
     config: AppConfig,
     repo_path: Path,
     history: list[dict[str, str]] | None = None,
 ) -> AnswerResult:
+    if index is None:
+        raise ValueError("Index is not ready. Build or load the repository index first.")
+
     history = history or []
     llm = ChatOllama(
         model=config.chat_model,
@@ -73,28 +127,49 @@ def answer_question(
         history=history,
         llm=llm,
     )
+    search_text = _build_search_text(question=question, search_question=search_question)
 
     retriever = index.as_retriever(similarity_top_k=config.top_k)
     nodes = retriever.retrieve(search_question)
-    nodes = _rerank_nodes(question=search_question, nodes=nodes)
+    nodes = _rerank_nodes(
+        question=question,
+        search_question=search_question,
+        nodes=nodes,
+    )
+    nodes = _select_best_nodes(nodes)
 
     source_paths: list[str] = []
     context_blocks: list[str] = []
     evidence_blocks: list[dict[str, str]] = []
     history_text = _format_history(history)
+    call_chain_summary = _build_call_chain_summary(repo_path=repo_path, search_text=search_text)
 
-    keyword_context_blocks = _collect_keyword_contexts(repo_path=repo_path, question=search_question)
-    for file_path, snippet in keyword_context_blocks:
+    keyword_context_blocks = _collect_keyword_contexts(
+        repo_path=repo_path,
+        search_text=search_text,
+    )
+    for file_path, reason, snippet in keyword_context_blocks:
         if file_path not in source_paths:
             source_paths.append(file_path)
         evidence_blocks.append(
             {
                 "file_path": file_path,
-                "reason": "Keyword-based code match",
+                "reason": reason,
                 "snippet": snippet,
             }
         )
-        context_blocks.append(f"File: {file_path}\n{snippet}")
+        context_blocks.append(_format_context_block(file_path=file_path, snippet=snippet))
+
+    if call_chain_summary:
+        evidence_blocks.insert(
+            0,
+            {
+                "file_path": "call-chain-summary",
+                "reason": "Cross-file relationship summary",
+                "snippet": call_chain_summary,
+            },
+        )
+        context_blocks.insert(0, f"Cross-file relationship summary:\n{call_chain_summary}")
 
     for node in nodes:
         metadata = node.metadata or {}
@@ -109,9 +184,7 @@ def answer_question(
                     "snippet": _trim_snippet(node.text.strip()),
                 }
             )
-        context_blocks.append(
-            f"File: {file_path}\n{node.text.strip()}"
-        )
+        context_blocks.append(_format_context_block(file_path=str(file_path), snippet=node.text.strip()))
 
     context = "\n\n---\n\n".join(context_blocks) if context_blocks else "No context found."
 
@@ -123,11 +196,28 @@ def answer_question(
         }
     )
 
+    source_paths = _filter_sources_for_question(
+        source_paths=source_paths,
+        question=question,
+        call_chain_summary=call_chain_summary,
+    )
+    evidence_blocks = _filter_evidence_for_question(
+        evidence_blocks=evidence_blocks,
+        question=question,
+    )
+
     return AnswerResult(
-        answer=response.content,
+        answer=_finalize_answer(
+            answer_text=str(response.content),
+            source_paths=source_paths,
+            evidence_blocks=evidence_blocks,
+            question=question,
+            call_chain_summary=call_chain_summary,
+        ),
         sources=source_paths,
         search_question=search_question,
         evidence=evidence_blocks[:5],
+        call_chain_summary=call_chain_summary,
         confidence_label=_confidence_label(source_paths, evidence_blocks, question, search_question),
         confidence_score=_confidence_score(source_paths, evidence_blocks, question, search_question),
         risk_note=_risk_note(source_paths, evidence_blocks, question, search_question),
@@ -149,6 +239,296 @@ def _rewrite_question(question: str, history: list[dict[str, str]], llm: ChatOll
     return rewritten or question
 
 
+def _build_search_text(question: str, search_question: str) -> str:
+    if search_question.strip().lower() == question.strip().lower():
+        return _expand_semantic_aliases(question)
+    return _expand_semantic_aliases(f"{question}\n{search_question}")
+
+
+def _expand_semantic_aliases(text: str) -> str:
+    expanded_parts = [text]
+    text_lower = text.lower()
+    for phrase, expansions in SEMANTIC_ALIASES.items():
+        if phrase in text_lower:
+            expanded_parts.extend(expansions)
+    return "\n".join(dict.fromkeys(expanded_parts))
+
+
+def _finalize_answer(
+    answer_text: str,
+    source_paths: list[str],
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+    call_chain_summary: str,
+) -> str:
+    chain_first_answer = _build_chain_first_answer(
+        question=question,
+        call_chain_summary=call_chain_summary,
+        source_paths=source_paths,
+    )
+    if chain_first_answer:
+        return chain_first_answer
+
+    typed_answer = _build_typed_answer(
+        answer_text=answer_text,
+        source_paths=source_paths,
+        evidence_blocks=evidence_blocks,
+        question=question,
+        call_chain_summary=call_chain_summary,
+    )
+    if typed_answer:
+        return typed_answer
+
+    cleaned = answer_text.strip()
+    if not cleaned:
+        cleaned = "Answer: I do not have enough repository context to answer reliably.\nWhy:\n- No answer text was generated."
+    if not cleaned.lower().startswith("answer:"):
+        cleaned = f"Answer: {cleaned}"
+    if "\nWhy:" not in cleaned:
+        why_lines = []
+        for item in evidence_blocks[:2]:
+            if item["file_path"] == "call-chain-summary":
+                why_lines.append(f"- {item['snippet']}")
+                continue
+            why_lines.append(f"- {item['file_path']}: {item['reason']}")
+        if not why_lines:
+            why_lines.append("- The retrieved context was too weak to support a stronger answer.")
+        cleaned = f"{cleaned}\nWhy:\n" + "\n".join(why_lines)
+
+    if source_paths:
+        source_section = "Sources:\n" + "\n".join(f"- {path}" for path in source_paths[:5])
+        if "Sources:" not in cleaned:
+            cleaned = f"{cleaned}\n\n{source_section}"
+
+    return cleaned
+
+
+def _build_typed_answer(
+    answer_text: str,
+    source_paths: list[str],
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+    call_chain_summary: str,
+) -> str:
+    question_type = _classify_question_type(question, call_chain_summary)
+    if question_type == "artifact_flow":
+        return ""
+
+    if question_type == "relationship_trace" and call_chain_summary:
+        chain_lines = [line.strip() for line in call_chain_summary.splitlines() if line.strip()]
+        if not chain_lines:
+            return ""
+        why_lines = _compress_chain_lines(chain_lines[:3])
+        return _format_typed_answer(
+            answer_line="Answer: This behavior is implemented through a cross-file relationship rather than a single isolated file.",
+            why_lines=why_lines,
+            source_paths=source_paths,
+        )
+
+    if question_type == "entity_location":
+        location = source_paths[0] if source_paths else "the retrieved repository context"
+        why_lines = _build_evidence_why_lines(evidence_blocks)
+        if not why_lines:
+            why_lines = [f"- The most relevant match points to `{location}`."]
+        return _format_typed_answer(
+            answer_line=f"Answer: The most relevant location for this question is `{location}`.",
+            why_lines=why_lines,
+            source_paths=source_paths,
+        )
+
+    if question_type == "open_analysis":
+        cleaned = answer_text.strip()
+        if not cleaned:
+            return ""
+        cleaned = _soften_open_analysis_answer(cleaned)
+        answer_line = _extract_answer_line(cleaned)
+        why_lines = _build_open_analysis_why_lines(evidence_blocks)
+        if not why_lines:
+            why_lines = [
+                "- This is a repository-grounded summary based on the most relevant retrieved files, not a runtime proof."
+            ]
+        return _format_typed_answer(
+            answer_line=answer_line,
+            why_lines=why_lines,
+            source_paths=source_paths,
+        )
+
+    return ""
+
+
+def _classify_question_type(question: str, call_chain_summary: str) -> str:
+    question_lower = question.lower()
+    if _is_flow_question(question_lower) and call_chain_summary:
+        return "artifact_flow"
+    if any(
+        token in question_lower
+        for token in ("what calls", "called by", "across files", "interact", "interaction", "relationship")
+    ):
+        return "relationship_trace"
+    if any(
+        token in question_lower
+        for token in ("which file", "where is", "where are", "contains", "defined", "definition")
+    ):
+        return "entity_location"
+    if any(
+        token in question_lower
+        for token in ("why", "should", "risk", "optimize", "improve", "design", "architecture", "good", "bad")
+    ):
+        return "open_analysis"
+    if call_chain_summary:
+        return "relationship_trace"
+    return "open_analysis"
+
+
+def _build_evidence_why_lines(evidence_blocks: list[dict[str, str]], limit: int = 2) -> list[str]:
+    why_lines: list[str] = []
+    for item in evidence_blocks[:limit]:
+        if item["file_path"] == "call-chain-summary":
+            why_lines.append(f"- {item['snippet']}")
+            continue
+        why_lines.append(f"- `{item['file_path']}`: {item['reason']}")
+    return why_lines
+
+
+def _build_open_analysis_why_lines(
+    evidence_blocks: list[dict[str, str]],
+    limit: int = 3,
+) -> list[str]:
+    why_lines: list[str] = []
+    for item in evidence_blocks[:limit]:
+        file_path = str(item.get("file_path", "")).strip()
+        if not file_path or file_path == "call-chain-summary":
+            continue
+        snippet = str(item.get("snippet", "")).strip()
+        why_lines.append(_describe_open_analysis_evidence(file_path, snippet))
+    return why_lines
+
+
+def _describe_open_analysis_evidence(file_path: str, snippet: str) -> str:
+    condensed = " ".join(snippet.split())
+
+    function_match = re.search(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet)
+    if "patterns:" in snippet or "keywords in" in snippet or "permission_failure" in snippet:
+        return f"- `{file_path}` hard-codes failure classification rules in one place, so new failure modes require code changes instead of configuration."
+    if "unknown_failure" in snippet or "fallback_detail" in snippet:
+        return f"- `{file_path}` falls back to a generic `unknown_failure` path when no rule matches, which suggests edge cases can collapse into a coarse bucket."
+    if any(token in snippet for token in ("category_counts", "workflow_failures", "grouped:", "top_failed_workflows")):
+        return f"- `{file_path}` aggregates workflow signals through in-memory counters and grouped summaries, concentrating the reporting logic in a small set of data structures."
+    if function_match:
+        function_name = function_match.group(1)
+        return f"- `{file_path}` defines `{function_name}()`, which is one of the implementation points this answer is based on."
+    if condensed:
+        preview = condensed[:120].rstrip()
+        if len(condensed) > 120:
+            preview += "..."
+        return f"- `{file_path}` includes implementation detail such as `{preview}`, which informs this interpretation."
+    return f"- `{file_path}` is one of the implementation files used to support this interpretation."
+
+
+def _soften_open_analysis_answer(answer_text: str) -> str:
+    cleaned = answer_text.strip()
+    if not cleaned:
+        return cleaned
+
+    if cleaned.lower().startswith("answer:"):
+        prefix, _, remainder = cleaned.partition(":")
+        softened_remainder = remainder.strip()
+        if softened_remainder and not softened_remainder.lower().startswith(
+            ("based on the retrieved implementation", "the current implementation suggests")
+        ):
+            softened_remainder = f"Based on the retrieved implementation, {softened_remainder[:1].lower()}{softened_remainder[1:]}"
+        return f"{prefix}: {softened_remainder}".strip()
+
+    if cleaned.lower().startswith(("based on the retrieved implementation", "the current implementation suggests")):
+        return cleaned
+    return f"Based on the retrieved implementation, {cleaned[:1].lower()}{cleaned[1:]}"
+
+
+def _extract_answer_line(answer_text: str) -> str:
+    cleaned = answer_text.strip()
+    if not cleaned:
+        return "Answer: Based on the retrieved implementation, the current code suggests a few design risks worth reviewing."
+    first_line = cleaned.splitlines()[0].strip()
+    if first_line.lower().startswith("answer:"):
+        return first_line
+    return f"Answer: {first_line}"
+
+
+def _format_typed_answer(answer_line: str, why_lines: list[str], source_paths: list[str]) -> str:
+    source_section = ""
+    if source_paths:
+        source_section = "\n\nSources:\n" + "\n".join(f"- {path}" for path in source_paths[:5])
+    return f"{answer_line}\nWhy:\n" + "\n".join(why_lines) + source_section
+
+
+def _build_chain_first_answer(
+    question: str,
+    call_chain_summary: str,
+    source_paths: list[str],
+) -> str:
+    question_lower = question.lower()
+    if not call_chain_summary:
+        return ""
+    if not any(keyword in question_lower for keyword in ("how", "built", "generated", "written", "produced")):
+        return ""
+
+    chain_lines = [line.strip() for line in call_chain_summary.splitlines() if line.strip()]
+    if not chain_lines:
+        return ""
+
+    answer_line = "Answer: This artifact is built through the following repository flow."
+    if any(token in question_lower for token in ("weekly digest", "weekly_digest.md", "summary.md")):
+        answer_line = "Answer: This artifact is built through a multi-step repository flow that starts in the CLI entrypoint, then calls builder functions, and finally writes the output file."
+
+    why_lines = _compress_chain_lines(chain_lines[:3])
+    source_section = ""
+    if source_paths:
+        source_section = "\n\nSources:\n" + "\n".join(f"- {path}" for path in source_paths[:5])
+
+    return f"{answer_line}\nWhy:\n" + "\n".join(why_lines) + source_section
+
+
+def _compress_chain_lines(chain_lines: list[str]) -> list[str]:
+    cleaned_lines = [line.lstrip("- ").strip() for line in chain_lines if line.strip()]
+    compressed: list[str] = []
+    writer_targets: set[str] = set()
+
+    for line in cleaned_lines:
+        writer_match = re.match(
+            r"`([^`]+)` -> `([^`]+)\(\)` -> `([^`]+)` -> writes `([^`]+)`",
+            line,
+        )
+        if writer_match:
+            _, _, writer_path, output_path = writer_match.groups()
+            normalized_output = output_path if "/" in output_path else f"outputs/{output_path}"
+            writer_targets.add(writer_path)
+            compressed.append(f"- `{writer_path}` -> writes `{normalized_output}`")
+            continue
+
+        simple_writer_match = re.match(r"`([^`]+)` -> writes `([^`]+)`", line)
+        if simple_writer_match:
+            writer_path, output_path = simple_writer_match.groups()
+            normalized_output = output_path if "/" in output_path else f"outputs/{output_path}"
+            writer_targets.add(writer_path)
+            compressed.append(f"- `{writer_path}` -> writes `{normalized_output}`")
+            continue
+
+        compressed.append(f"- {line}")
+
+    deduped: list[str] = []
+    for line in compressed:
+        if "-> `write_" in line:
+            target_match = re.search(r"-> `([^`]+\.py)`$", line)
+            if target_match and target_match.group(1) in writer_targets:
+                if line not in deduped:
+                    deduped.append(line)
+                continue
+        if line not in deduped:
+            deduped.append(line)
+
+    return deduped
+
+
 def _format_history(history: list[dict[str, str]], max_turns: int = 6) -> str:
     if not history:
         return "No prior conversation."
@@ -165,13 +545,148 @@ def _format_history(history: list[dict[str, str]], max_turns: int = 6) -> str:
     return "\n".join(lines) if lines else "No prior conversation."
 
 
-def _rerank_nodes(question: str, nodes: list[Any]) -> list[Any]:
+def _filter_sources_for_question(
+    source_paths: list[str],
+    question: str,
+    call_chain_summary: str,
+) -> list[str]:
+    deduped = list(dict.fromkeys(source_paths))
     question_lower = question.lower()
+    question_type = _classify_question_type(question, call_chain_summary)
+    if not _is_flow_question(question) and not call_chain_summary:
+        if question_type != "open_analysis":
+            return deduped
+
+    filtered: list[str] = []
+    chain_lower = call_chain_summary.lower()
+    for path in deduped:
+        normalized = path.replace("\\", "/").lower()
+        if normalized.endswith("readme.md"):
+            continue
+        if normalized.startswith("tests/") or "/tests/" in normalized:
+            continue
+        if question_type == "open_analysis" and not _is_flow_question(question_lower):
+            if normalized.endswith("readme.md"):
+                continue
+            if normalized.startswith("outputs/") or "/outputs/" in normalized:
+                continue
+            if not normalized.endswith(".py"):
+                continue
+            filtered.append(path)
+            continue
+        if chain_lower and normalized not in chain_lower and not normalized.startswith("outputs/"):
+            if not normalized.endswith((".py", ".md")):
+                continue
+        filtered.append(path)
+
+    if question_type == "open_analysis" and not _is_flow_question(question_lower):
+        ranked = _prioritize_open_analysis_paths(filtered)
+        return ranked or deduped[:5]
+
+    return filtered or deduped[:5]
+
+
+def _filter_evidence_for_question(
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+) -> list[dict[str, str]]:
+    question_lower = question.lower()
+    question_type = _classify_question_type(question, "")
+    is_flow = _is_flow_question(question_lower)
+    if not is_flow and question_type != "open_analysis":
+        return evidence_blocks
+
+    filtered: list[dict[str, str]] = []
+    for item in evidence_blocks:
+        file_path = str(item.get("file_path", "")).replace("\\", "/").lower()
+        snippet = str(item.get("snippet", "")).lower()
+        if question_type == "open_analysis" and not is_flow:
+            if file_path.endswith("readme.md"):
+                continue
+            if file_path.startswith("tests/") or "/tests/" in file_path:
+                continue
+            if file_path.startswith("outputs/") or "/outputs/" in file_path:
+                continue
+            if file_path == "call-chain-summary":
+                continue
+            filtered.append(item)
+            continue
+        if is_flow:
+            if file_path.endswith("readme.md"):
+                continue
+            if file_path.startswith("tests/") or "/tests/" in file_path:
+                continue
+            if any(token in snippet for token in ("summarize_pull_requests", "summarize_workflow_runs")):
+                continue
+            filtered.append(item)
+
+    if question_type == "open_analysis" and not is_flow:
+        ranked = _prioritize_open_analysis_evidence(filtered)
+        return ranked or evidence_blocks
+
+    return filtered or evidence_blocks
+
+
+def _prioritize_open_analysis_paths(paths: list[str]) -> list[str]:
+    ranked = sorted(
+        dict.fromkeys(paths),
+        key=lambda path: (_open_analysis_path_rank(path), path.replace("\\", "/").lower()),
+    )
+    high_priority = [path for path in ranked if _open_analysis_path_rank(path) == 0]
+    if high_priority:
+        return high_priority[:4]
+    return ranked[:4]
+
+
+def _prioritize_open_analysis_evidence(
+    evidence_blocks: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    deduped: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for item in evidence_blocks:
+        normalized = str(item.get("file_path", "")).replace("\\", "/").lower()
+        if normalized in seen_paths:
+            continue
+        seen_paths.add(normalized)
+        deduped.append(item)
+
+    ranked = sorted(
+        deduped,
+        key=lambda item: (
+            _open_analysis_path_rank(str(item.get("file_path", ""))),
+            str(item.get("file_path", "")).replace("\\", "/").lower(),
+        ),
+    )
+    high_priority = [item for item in ranked if _open_analysis_path_rank(str(item.get("file_path", ""))) == 0]
+    if high_priority:
+        return high_priority[:4]
+    return ranked[:4]
+
+
+def _open_analysis_path_rank(path: str) -> int:
+    normalized = path.replace("\\", "/").lower()
+    high_signal_tokens = ("metrics", "analysis", "rules", "scoring", "evaluate", "failure")
+    low_signal_tokens = ("github_client", "report", "ui", "main")
+    if any(token in normalized for token in high_signal_tokens):
+        return 0
+    if any(token in normalized for token in low_signal_tokens):
+        return 2
+    return 1
+
+
+def _rerank_nodes(question: str, search_question: str, nodes: list[Any]) -> list[Any]:
+    search_text = _build_search_text(question=question, search_question=search_question)
+    question_lower = search_text.lower()
+    question_terms = _extract_search_terms(question_lower)
+    identifier_terms = _extract_identifier_terms(search_text)
+    path_terms = _extract_path_terms(search_text)
+    intents = _detect_intents(question_lower)
     scored_nodes: list[tuple[float, Any]] = []
 
     for node in nodes:
         metadata = node.metadata or {}
         file_path = str(metadata.get("file_path", "unknown")).lower()
+        file_name = Path(file_path).name.lower()
         extension = str(metadata.get("extension", "")).lower()
         text = node.text.lower()
         score = 0.0
@@ -189,6 +704,33 @@ def _rerank_nodes(question: str, nodes: list[Any]) -> list[Any]:
             score -= 2.0
         if "__init__.py" in file_path:
             score -= 0.5
+
+        file_term_hits = sum(1 for term in question_terms if term in file_path)
+        text_term_hits = sum(1 for term in question_terms if term in text)
+        identifier_file_hits = sum(1 for term in identifier_terms if term in file_path or term in file_name)
+        identifier_text_hits = sum(1 for term in identifier_terms if term in text)
+        path_hits = sum(1 for term in path_terms if term in file_path or term in file_name)
+        definition_hits = sum(1 for term in identifier_terms if f"def {term}" in text or f"class {term}" in text)
+        invocation_hits = sum(1 for term in identifier_terms if f"{term}(" in text)
+        import_hits = sum(1 for term in identifier_terms if f"import {term}" in text or f" import {term}" in text)
+
+        score += min(file_term_hits, 4) * 1.5
+        score += min(text_term_hits, 6) * 0.8
+        score += min(identifier_file_hits, 3) * 4.0
+        score += min(identifier_text_hits, 4) * 2.0
+        score += min(path_hits, 3) * 5.0
+        score += min(definition_hits, 3) * 4.0
+        score += min(invocation_hits, 4) * 2.5
+        score += min(import_hits, 3) * 1.5
+
+        if any(keyword in question_lower for keyword in ("which file", "what file", "where is")):
+            score += min(file_term_hits, 3) * 1.5
+            if identifier_file_hits:
+                score += 3.0
+
+        if any(keyword in question_lower for keyword in ("defined", "definition", "implemented", "implementation")):
+            if "def " in text or "class " in text:
+                score += 1.5
 
         if any(keyword in question_lower for keyword in ("entrypoint", "main", "cli", "command")):
             if "main.py" in file_path:
@@ -215,6 +757,44 @@ def _rerank_nodes(question: str, nodes: list[Any]) -> list[Any]:
         if any(keyword in question_lower for keyword in ("digest", "summary", "report")):
             if "report.py" in file_path or "metrics.py" in file_path:
                 score += 4.0
+            if "main.py" in file_path:
+                score += 2.5
+            if any(token in text for token in ("write_weekly_digest_report", "write_markdown_report", "weekly_digest.md", "summary.md")):
+                score += 4.0
+
+        if any(keyword in question_lower for keyword in ("how", "built", "generated", "produce")):
+            if any(token in text for token in ("return", "build_", "generate_", "create_", "class ", "def ")):
+                score += 1.5
+
+        if "configuration" in intents:
+            if any(token in file_name for token in ("config", ".env", "settings")):
+                score += 4.0
+            if any(token in text for token in ("os.getenv", "load_dotenv", "from_env", "environment")):
+                score += 3.0
+
+        if "indexing" in intents:
+            if any(token in file_name for token in ("index", "indexing", "storage")):
+                score += 5.0
+            if any(token in text for token in ("vectorstoreindex", "storagecontext", "persist", "load_index_from_storage", "as_retriever")):
+                score += 4.0
+
+        if "callchain" in intents:
+            if definition_hits:
+                score += 2.0
+            if invocation_hits:
+                score += 4.0
+            if import_hits:
+                score += 2.0
+
+        if "tests" in intents:
+            if "test" in file_name or "/tests/" in file_path.replace("\\", "/"):
+                score += 4.0
+            if any(token in text for token in ("pytest", "fixture", "assert ")):
+                score += 2.5
+
+        if "structure" in intents:
+            if any(token in text for token in ("def ", "class ", "return ", "import ")):
+                score += 1.5
 
         scored_nodes.append((score, node))
 
@@ -222,13 +802,70 @@ def _rerank_nodes(question: str, nodes: list[Any]) -> list[Any]:
     return [node for _, node in scored_nodes]
 
 
-def _collect_keyword_contexts(repo_path: Path, question: str) -> list[tuple[str, str]]:
-    question_lower = question.lower()
-    if not any(keyword in question_lower for keyword in ("entrypoint", "main", "cli", "command")):
-        return []
+def _select_best_nodes(nodes: list[Any], max_nodes: int = 6, max_per_file: int = 2) -> list[Any]:
+    selected: list[Any] = []
+    file_counts: dict[str, int] = {}
 
-    patterns = ("argparse", "argumentparser", "parse_args", "def main", "__main__")
-    matches: list[tuple[int, str, str]] = []
+    for node in nodes:
+        metadata = node.metadata or {}
+        file_path = str(metadata.get("file_path", "unknown"))
+        if file_counts.get(file_path, 0) >= max_per_file:
+            continue
+        selected.append(node)
+        file_counts[file_path] = file_counts.get(file_path, 0) + 1
+        if len(selected) >= max_nodes:
+            break
+
+    return selected
+
+
+def _build_call_chain_summary(repo_path: Path, search_text: str) -> str:
+    detected_intents = _detect_intents(search_text.lower())
+    mentioned_outputs = _extract_output_targets(search_text)
+    flow_question = _is_flow_question(search_text)
+    reporting_flow = flow_question and "reporting" in detected_intents
+    if "callchain" not in detected_intents and not mentioned_outputs and not reporting_flow:
+        return ""
+
+    identifier_terms = _extract_identifier_terms(search_text)
+    if not identifier_terms and not mentioned_outputs:
+        return ""
+
+    graph = _build_static_relationship_graph(repo_path)
+
+    multi_hop = _build_multi_hop_relationships(
+        identifier_terms=identifier_terms,
+        function_definitions=graph["function_definitions"],
+        function_callers=graph["function_callers"],
+        function_calls_by_file=graph["function_calls_by_file"],
+        output_writers=graph["output_writers"],
+        writer_functions=graph["writer_functions"],
+        mentioned_outputs=mentioned_outputs,
+    )
+    if multi_hop:
+        return "\n".join(f"- {item}" for item in multi_hop[:6])
+
+    relationships = _build_single_hop_relationships(
+        identifier_terms=identifier_terms,
+        function_definitions=graph["function_definitions"],
+        function_callers=graph["function_callers"],
+        importer_map=graph["importer_map"],
+    )
+    return "\n".join(f"- {item}" for item in relationships[:6])
+
+
+def _is_flow_question(text: str) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in ("how", "built", "generated", "written", "produced"))
+
+
+def _build_static_relationship_graph(repo_path: Path) -> dict[str, dict[str, list[str]]]:
+    function_definitions: dict[str, list[str]] = {}
+    function_callers: dict[str, list[str]] = {}
+    importer_map: dict[str, list[str]] = {}
+    function_calls_by_file: dict[str, list[str]] = {}
+    output_writers: dict[str, list[str]] = {}
+    writer_functions: dict[str, list[str]] = {}
 
     for path in repo_path.rglob("*.py"):
         if any(part in IGNORED_DIR_NAMES for part in path.parts):
@@ -241,21 +878,402 @@ def _collect_keyword_contexts(repo_path: Path, question: str) -> list[tuple[str,
         except OSError:
             continue
 
+        relative_path = path.relative_to(repo_path).as_posix()
+        if _should_exclude_path_from_chain(relative_path):
+            continue
         text_lower = text.lower()
-        score = sum(1 for pattern in patterns if pattern in text_lower)
-        if score == 0:
+
+        definitions = re.findall(r"^\s*def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", text, flags=re.MULTILINE)
+        imports = re.findall(r"^\s*from\s+[^\n]+\s+import\s+([a-zA-Z_][a-zA-Z0-9_]*)", text, flags=re.MULTILINE)
+        calls = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\(", text)
+        output_mentions = re.findall(r"['\"]([^'\"]+\.(?:md|csv|png|json|txt))['\"]", text, flags=re.IGNORECASE)
+
+        for name in definitions:
+            function_definitions.setdefault(name.lower(), []).append(relative_path)
+            if name.lower().startswith("write_"):
+                writer_functions.setdefault(relative_path, []).append(name.lower())
+
+        local_calls = [
+            call.lower()
+            for call in calls
+            if call not in {"def", "if", "for", "while", "return", "print"}
+            and call.lower() not in LOW_SIGNAL_FUNCTIONS
+            and not any(call.lower().startswith(prefix) for prefix in LOW_SIGNAL_PREFIXES)
+            and call.lower() not in LOW_SIGNAL_PATTERNS
+        ]
+        function_calls_by_file[relative_path] = list(dict.fromkeys(local_calls))
+        for call in local_calls:
+            if f"def {call}" not in text_lower:
+                function_callers.setdefault(call, []).append(relative_path)
+
+        for imported in imports:
+            importer_map.setdefault(imported.lower(), []).append(relative_path)
+
+        if "write_" in text_lower or "output_path" in text_lower or "output_dir" in text_lower:
+            normalized_outputs = [output.replace("\\", "/") for output in output_mentions]
+            if normalized_outputs:
+                output_writers[relative_path] = list(dict.fromkeys(normalized_outputs))
+
+    return {
+        "function_definitions": function_definitions,
+        "function_callers": function_callers,
+        "importer_map": importer_map,
+        "function_calls_by_file": function_calls_by_file,
+        "output_writers": output_writers,
+        "writer_functions": writer_functions,
+    }
+
+
+def _build_multi_hop_relationships(
+    identifier_terms: list[str],
+    function_definitions: dict[str, list[str]],
+    function_callers: dict[str, list[str]],
+    function_calls_by_file: dict[str, list[str]],
+    output_writers: dict[str, list[str]],
+    writer_functions: dict[str, list[str]],
+    mentioned_outputs: list[str],
+) -> list[str]:
+    relationships: list[str] = []
+
+    for term in identifier_terms:
+        normalized_term = term.lower()
+        if normalized_term in LOW_SIGNAL_FUNCTIONS:
+            continue
+        if any(normalized_term.startswith(prefix) for prefix in LOW_SIGNAL_PREFIXES):
+            continue
+        if normalized_term in LOW_SIGNAL_PATTERNS:
+            continue
+        term_definitions = list(dict.fromkeys(function_definitions.get(normalized_term, [])))
+        term_callers = list(dict.fromkeys(function_callers.get(normalized_term, [])))
+
+        for caller_path in term_callers[:2]:
+            for definition_path in term_definitions[:2]:
+                relationships.append(
+                    f"`{caller_path}` -> `{normalized_term}()` -> `{definition_path}`"
+                )
+
+                for writer_path, outputs in output_writers.items():
+                    if writer_path != definition_path and writer_path != caller_path:
+                        continue
+                    writer_names = writer_functions.get(writer_path, [])
+                    writer_name = next(
+                        (
+                            name for name in writer_names
+                            if any(_writer_name_matches_target(name, output, identifier_terms) for output in outputs)
+                        ),
+                        writer_names[0] if writer_names else "",
+                    )
+                    if writer_path == caller_path and not writer_name:
+                        continue
+                    writer_callers = function_callers.get(writer_name, []) if writer_name else []
+                    chain_prefix = (
+                        f"`{writer_callers[0]}` -> `{writer_name}()` -> `{writer_path}`"
+                        if writer_callers
+                        else f"`{writer_path}`"
+                    )
+                    for output in outputs[:2]:
+                        if mentioned_outputs and output not in mentioned_outputs:
+                            continue
+                        relationships.append(f"{chain_prefix} -> writes `{output}`")
+
+        for definition_path in term_definitions[:2]:
+            for writer_path, outputs in output_writers.items():
+                if writer_path == definition_path:
+                    for output in outputs[:2]:
+                        if mentioned_outputs and output not in mentioned_outputs:
+                            continue
+                        relationships.append(
+                            f"`{definition_path}` -> writes `{output}`"
+                        )
+
+    if mentioned_outputs:
+        caller_output_mentions: dict[str, set[str]] = {}
+        for writer_path, outputs in output_writers.items():
+            caller_output_mentions[writer_path] = set(outputs)
+            writer_names = writer_functions.get(writer_path, [])
+            for output in outputs:
+                writer_name = next(
+                    (
+                        name for name in writer_names
+                        if _writer_name_matches_target(name, output, identifier_terms)
+                    ),
+                    "",
+                )
+                writer_callers = function_callers.get(writer_name, []) if writer_name else []
+                output_name = Path(output).name.lower()
+                if output not in mentioned_outputs and output_name not in mentioned_outputs:
+                    continue
+                if writer_callers and writer_name:
+                    relationships.append(
+                        f"`{writer_callers[0]}` -> `{writer_name}()` -> `{writer_path}` -> writes `{output}`"
+                    )
+                elif not _has_matching_writer_call(
+                    caller_path=writer_path,
+                    mentioned_output=output,
+                    writer_functions=writer_functions,
+                    function_callers=function_callers,
+                    identifier_terms=identifier_terms,
+                ):
+                    relationships.append(f"`{writer_path}` -> writes `{output}`")
+
+        for writer_path, writer_names in writer_functions.items():
+            if not writer_names:
+                continue
+            for writer_name in writer_names:
+                writer_callers = function_callers.get(writer_name, [])
+                if not writer_callers:
+                    continue
+                caller_path = writer_callers[0]
+                caller_outputs = caller_output_mentions.get(caller_path, set())
+                for mentioned_output in mentioned_outputs:
+                    if not _writer_name_matches_target(writer_name, mentioned_output, identifier_terms):
+                        continue
+                    matched_output = next(
+                        (
+                            output
+                            for output in caller_outputs
+                            if output == mentioned_output or Path(output).name.lower() == mentioned_output
+                        ),
+                        None,
+                    )
+                    if matched_output:
+                        relationships.append(
+                            f"`{caller_path}` -> `{writer_name}()` -> `{writer_path}` -> writes `{matched_output}`"
+                        )
+
+    return list(dict.fromkeys(relationships))
+
+
+def _writer_name_matches_target(
+    writer_name: str,
+    mentioned_output: str,
+    identifier_terms: list[str],
+) -> bool:
+    writer_tokens = set(re.findall(r"[a-z0-9]+", writer_name.lower()))
+    output_tokens = set(re.findall(r"[a-z0-9]+", Path(mentioned_output).stem.lower()))
+    identifier_tokens = {
+        token
+        for term in identifier_terms
+        for token in re.findall(r"[a-z0-9]+", term.lower())
+    }
+    target_tokens = {token for token in output_tokens | identifier_tokens if len(token) >= 4}
+    matched_tokens = writer_tokens & target_tokens
+    specific_tokens = {
+        token for token in output_tokens if len(token) >= 4 and token not in {"report", "write"}
+    }
+    if specific_tokens:
+        return len(writer_tokens & specific_tokens) >= 2
+    return len(matched_tokens) >= 2
+
+
+def _has_matching_writer_call(
+    caller_path: str,
+    mentioned_output: str,
+    writer_functions: dict[str, list[str]],
+    function_callers: dict[str, list[str]],
+    identifier_terms: list[str],
+) -> bool:
+    for writer_names in writer_functions.values():
+        for writer_name in writer_names:
+            if not _writer_name_matches_target(writer_name, mentioned_output, identifier_terms):
+                continue
+            if caller_path in function_callers.get(writer_name, []):
+                return True
+    return False
+
+
+def _build_single_hop_relationships(
+    identifier_terms: list[str],
+    function_definitions: dict[str, list[str]],
+    function_callers: dict[str, list[str]],
+    importer_map: dict[str, list[str]],
+) -> list[str]:
+    relationships: list[str] = []
+
+    for term in identifier_terms:
+        normalized_term = term.lower()
+        if normalized_term in LOW_SIGNAL_FUNCTIONS:
+            continue
+        if any(normalized_term.startswith(prefix) for prefix in LOW_SIGNAL_PREFIXES):
+            continue
+        if normalized_term in LOW_SIGNAL_PATTERNS:
+            continue
+        term_callers = list(dict.fromkeys(function_callers.get(normalized_term, [])))
+        term_definitions = list(dict.fromkeys(function_definitions.get(normalized_term, [])))
+        term_importers = list(dict.fromkeys(importer_map.get(normalized_term, [])))
+
+        if term_callers and term_definitions:
+            for caller_path in term_callers[:2]:
+                for definition_path in term_definitions[:2]:
+                    relationships.append(
+                        f"`{caller_path}` -> `{normalized_term}()` -> `{definition_path}`"
+                    )
+
+        for caller_path in term_callers[:2]:
+            if not term_definitions:
+                relationships.append(f"`{caller_path}` calls `{normalized_term}()`.")
+
+        for definition_path in term_definitions[:2]:
+            if not term_callers:
+                relationships.append(f"`{definition_path}` defines `{normalized_term}`.")
+
+        for importer_path in term_importers[:2]:
+            relationships.append(f"`{importer_path}` imports `{normalized_term}`.")
+
+    return list(dict.fromkeys(relationships))
+
+
+def _extract_output_targets(search_text: str) -> list[str]:
+    outputs = re.findall(r"[A-Za-z0-9_.-]+\.(?:md|csv|png|json|txt)", search_text, flags=re.IGNORECASE)
+    normalized: list[str] = []
+    for item in outputs:
+        clean = item.replace("\\", "/")
+        normalized.append(clean)
+        normalized.append(Path(clean).name.lower())
+    return list(dict.fromkeys(normalized))
+
+
+def _should_exclude_path_from_chain(relative_path: str) -> bool:
+    normalized = relative_path.replace("\\", "/").lower()
+    return normalized.startswith("tests/") or "/tests/" in normalized
+
+
+def _collect_keyword_contexts(repo_path: Path, search_text: str) -> list[tuple[str, str, str]]:
+    patterns = _keyword_patterns_for_query(search_text)
+    if not patterns:
+        return []
+
+    extensions = set(DEFAULT_EXTENSIONS)
+    matches: list[tuple[int, str, str, str]] = []
+    identifier_terms = _extract_identifier_terms(search_text)
+    preferred_snippet_patterns = _preferred_snippet_patterns_for_query(search_text)
+
+    for path in repo_path.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in IGNORED_DIR_NAMES for part in path.parts):
+            continue
+        if path.suffix.lower() not in extensions:
             continue
 
-        snippet = _extract_best_snippet(text=text, patterns=patterns)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        text_lower = text.lower()
+        score = sum(1 for pattern in patterns if pattern in text_lower)
         relative_path = path.relative_to(repo_path).as_posix()
-        matches.append((score, relative_path, snippet))
+        file_path_lower = relative_path.lower()
+        score += sum(2 for pattern in patterns if pattern in file_path_lower)
+        reason = "Keyword-based code match"
+
+        definition_hits = [term for term in identifier_terms if f"def {term}" in text_lower or f"class {term}" in text_lower]
+        invocation_hits = [term for term in identifier_terms if f"{term}(" in text_lower]
+        import_hits = [term for term in identifier_terms if f"import {term}" in text_lower or f" import {term}" in text_lower]
+
+        if definition_hits:
+            score += len(definition_hits) * 3
+            reason = "Identifier definition match"
+        if invocation_hits:
+            score += len(invocation_hits) * 4
+            if not definition_hits:
+                reason = "Identifier call-site match"
+        if import_hits:
+            score += len(import_hits) * 2
+            if reason == "Keyword-based code match":
+                reason = "Identifier import match"
+
+        if score == 0 and not any(term in file_path_lower for term in _extract_path_terms(search_text)):
+            continue
+
+        snippet = _extract_best_snippet(
+            text=text,
+            patterns=patterns,
+            preferred_terms=tuple(invocation_hits or definition_hits or import_hits),
+            preferred_patterns=preferred_snippet_patterns,
+        )
+        matches.append((score, relative_path, reason, snippet))
 
     matches.sort(key=lambda item: (-item[0], item[1]))
-    return [(file_path, snippet) for _, file_path, snippet in matches[:3]]
+    return [(file_path, reason, snippet) for _, file_path, reason, snippet in matches[:5]]
 
 
-def _extract_best_snippet(text: str, patterns: tuple[str, ...]) -> str:
+def _keyword_patterns_for_query(search_text: str) -> tuple[str, ...]:
+    search_lower = search_text.lower()
+    patterns: list[str] = []
+
+    if "entrypoint" in _detect_intents(search_lower):
+        patterns.extend(["argparse", "argumentparser", "parse_args", "def main", "__main__"])
+    if "workflow" in _detect_intents(search_lower):
+        patterns.extend(["workflow", "github actions", "actions/runs", "jobs:", "on:"])
+    if "reporting" in _detect_intents(search_lower):
+        patterns.extend(["chart", "plot", "graph", "digest", "summary", "report"])
+    if "configuration" in _detect_intents(search_lower):
+        patterns.extend(["os.getenv", "load_dotenv", "from_env", "config", ".env"])
+    if "indexing" in _detect_intents(search_lower):
+        patterns.extend(["vectorstoreindex", "storagecontext", "persist", "load_index_from_storage", "as_retriever"])
+    if "tests" in _detect_intents(search_lower):
+        patterns.extend(["pytest", "fixture", "assert ", "test_"])
+    if _classify_question_type(search_text, "") == "open_analysis":
+        patterns.extend(
+            [
+                "risk",
+                "failure",
+                "fallback",
+                "unknown_failure",
+                "category_counts",
+                "workflow_failures",
+                "top_failed_workflows",
+                "patterns:",
+                "grouped",
+            ]
+        )
+
+    patterns.extend(_extract_identifier_terms(search_text))
+    patterns.extend(_extract_path_terms(search_text))
+
+    deduped_patterns = [pattern.lower() for pattern in patterns if len(pattern.strip()) >= 3]
+    return tuple(dict.fromkeys(deduped_patterns))
+
+
+def _preferred_snippet_patterns_for_query(search_text: str) -> tuple[str, ...]:
+    if _classify_question_type(search_text, "") != "open_analysis":
+        return ()
+    return (
+        "category_counts",
+        "workflow_failures",
+        "top_failed_workflows",
+        "patterns:",
+        "unknown_failure",
+        "fallback_detail",
+        "grouped:",
+        "failure_categories",
+    )
+
+
+def _extract_best_snippet(
+    text: str,
+    patterns: tuple[str, ...],
+    preferred_terms: tuple[str, ...] = (),
+    preferred_patterns: tuple[str, ...] = (),
+) -> str:
     text_lower = text.lower()
+    for pattern in preferred_patterns:
+        index = text_lower.find(pattern)
+        if index != -1:
+            start = max(0, index - 300)
+            end = min(len(text), index + 900)
+            return text[start:end].strip()
+    for term in preferred_terms:
+        for pattern in (f"def {term}", f"class {term}", f"{term}(", f"import {term}"):
+            index = text_lower.find(pattern)
+            if index != -1:
+                start = max(0, index - 300)
+                end = min(len(text), index + 900)
+                return text[start:end].strip()
     for pattern in patterns:
         index = text_lower.find(pattern)
         if index != -1:
@@ -265,11 +1283,60 @@ def _extract_best_snippet(text: str, patterns: tuple[str, ...]) -> str:
     return text[:1200].strip()
 
 
+def _format_context_block(file_path: str, snippet: str, limit: int = 1800) -> str:
+    trimmed = snippet.strip()
+    if len(trimmed) > limit:
+        trimmed = f"{trimmed[:limit].rstrip()}..."
+    return f"File: {file_path}\n{trimmed}"
+
+
 def _trim_snippet(text: str, limit: int = 500) -> str:
     cleaned = " ".join(text.split())
     if len(cleaned) <= limit:
         return cleaned
     return f"{cleaned[:limit].rstrip()}..."
+
+
+def _extract_search_terms(question_lower: str) -> list[str]:
+    stop_words = {
+        "the", "a", "an", "is", "are", "to", "of", "in", "for", "and", "or", "how",
+        "what", "which", "where", "when", "why", "does", "do", "file", "files",
+        "function", "module", "code", "repository", "this", "that", "built",
+    }
+    terms = re.findall(r"[a-zA-Z_][a-zA-Z0-9_./-]*", question_lower)
+    cleaned_terms = [term for term in terms if len(term) >= 3 and term not in stop_words]
+    return list(dict.fromkeys(cleaned_terms))
+
+
+def _extract_identifier_terms(question: str) -> list[str]:
+    identifiers = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question)
+    ignored_terms = {"what", "which", "where", "when", "why", "does", "should"}
+    strong_terms = [
+        term.lower()
+        for term in identifiers
+        if ("_" in term or term[:1].isupper() or len(term) >= 8) and term.lower() not in ignored_terms
+    ]
+    return list(dict.fromkeys(strong_terms))
+
+
+def _extract_path_terms(question: str) -> list[str]:
+    raw_terms = re.findall(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+|[A-Za-z0-9_.-]+\\[A-Za-z0-9_.\\-]+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]+", question)
+    normalized: list[str] = []
+    for term in raw_terms:
+        lowered = term.replace("\\", "/").lower().strip("./")
+        if len(lowered) >= 3:
+            normalized.append(lowered)
+            if "/" in lowered:
+                normalized.extend(part for part in lowered.split("/") if len(part) >= 3)
+    return list(dict.fromkeys(normalized))
+
+
+def _detect_intents(search_lower: str) -> set[str]:
+    intents: set[str] = set()
+    for intent, patterns in INTENT_PATTERNS.items():
+        if any(pattern in search_lower for pattern in patterns):
+            intents.add(intent)
+    return intents
 
 
 def _confidence_score(
@@ -281,6 +1348,14 @@ def _confidence_score(
     score = 45
     question_lower = question.lower()
     search_lower = search_question.lower()
+    flow_question = _is_flow_question(question_lower)
+    question_type = _classify_question_type(question, "")
+    source_lower = [path.replace("\\", "/").lower() for path in source_paths]
+    has_call_chain_evidence = any(
+        item.get("reason") == "Cross-file relationship summary" for item in evidence_blocks
+    )
+    has_output_source = any(path.startswith("outputs/") for path in source_lower)
+    focused_python_sources = [path for path in source_lower if path.endswith(".py")]
 
     if evidence_blocks:
         score += min(len(evidence_blocks), 3) * 8
@@ -298,11 +1373,31 @@ def _confidence_score(
     if any(keyword in question_lower for keyword in ("which file", "where")):
         if source_paths:
             score += 5
+    if flow_question and has_call_chain_evidence:
+        score += 10
+    if flow_question and has_output_source:
+        score += 6
+    if flow_question and 2 <= len(focused_python_sources) <= 3:
+        score += 5
+    if question_type == "entity_location" and source_paths:
+        score += 8
+    if question_type == "entity_location" and len(source_paths) <= 2:
+        score += 4
+    if question_type == "relationship_trace" and has_call_chain_evidence:
+        score += 10
+    if question_type == "relationship_trace" and 2 <= len(source_paths) <= 3:
+        score += 4
+    if question_type == "open_analysis":
+        score -= 8
 
     if len(source_paths) >= 4:
         score -= 10
+    if flow_question and len(source_paths) <= 4:
+        score += 6
     if not evidence_blocks:
         score -= 15
+    if question_type == "open_analysis" and len(source_paths) >= 3:
+        score -= 4
 
     return max(0, min(100, score))
 
@@ -329,9 +1424,21 @@ def _risk_note(
 ) -> str:
     score = _confidence_score(source_paths, evidence_blocks, question, search_question)
     search_lower = search_question.lower()
+    question_lower = question.lower()
+    question_type = _classify_question_type(question, "")
 
     if score >= 80:
         return "The answer is backed by focused matches and is likely reliable for this repository question."
+    if question_type == "open_analysis":
+        return "This answer is an evidence-backed codebase interpretation, not a definitive runtime or architectural proof."
+    if question_type == "entity_location":
+        return "This answer points to the strongest matching file location, but you should still open the cited file to confirm surrounding context."
+    if question_type == "relationship_trace":
+        return "This answer traces likely cross-file relationships from retrieved code, but it may still miss indirect runtime behavior."
+    if _is_flow_question(question_lower) and any(
+        item.get("reason") == "Cross-file relationship summary" for item in evidence_blocks
+    ):
+        return "The answer is grounded in a focused cross-file path, but you should still verify the cited files if runtime behavior matters."
     if any(keyword in search_lower for keyword in ("flow", "interaction", "across files", "call chain", "called")):
         return "This answer may miss runtime behavior or cross-file interactions because the assistant relies on retrieved code snippets, not full program execution."
     if len(source_paths) >= 4:

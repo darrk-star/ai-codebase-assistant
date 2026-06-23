@@ -1,0 +1,46 @@
+﻿{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Ensure Ollama Running",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "$ErrorActionPreference = 'Stop'; try { $client = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 11434); $client.Close(); Write-Host 'Ollama already running on 127.0.0.1:11434.' } catch { Write-Host 'Ollama is not running. Starting ollama serve...'; Start-Process -FilePath 'ollama' -ArgumentList 'serve' -WindowStyle Hidden; Start-Sleep -Seconds 4; try { $client = [System.Net.Sockets.TcpClient]::new('127.0.0.1', 11434); $client.Close(); Write-Host 'Ollama started successfully.' } catch { throw 'Failed to start Ollama automatically. Run `ollama serve` manually, then retry.' } }"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Start Streamlit UI",
+      "type": "shell",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "streamlit",
+        "run",
+        "app/ui.py"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": [
+        "Ensure Ollama Running"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}

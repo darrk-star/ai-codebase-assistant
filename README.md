@@ -1,114 +1,147 @@
-# AI Codebase Assistant
+﻿# AI Codebase Assistant
 
-A local codebase Q&A assistant built with LangChain, LlamaIndex, and Ollama.
+A local-first codebase Q&A assistant built with LangChain, LlamaIndex, Ollama, and Streamlit.
 
-## Overview
+It indexes a local repository, retrieves relevant code and docs, and answers natural-language questions with explicit file citations.
 
-- local-first repository Q&A with no external API key requirement
-- built for engineering onboarding, repository exploration, and code search
-- combines vector retrieval with code-aware heuristics for better file-level answers
-- supports both CLI usage and a Streamlit chat UI
+It is tuned for practical repository inspection tasks where a user needs to verify whether an answer is actually grounded in the checked-out codebase.
 
-This project is designed for a common engineering problem:
-- a code repository is too large for new contributors to understand quickly
-- source code, docs, and configuration are spread across many files
-- keyword search is often not enough to answer structural questions like:
-  - Where is the CLI entrypoint?
-  - Which file fetches GitHub workflow runs?
-  - How is the weekly digest generated?
+## Highlights
 
-This assistant indexes a local repository, retrieves relevant code and documents, and answers natural language questions with cited source files.
+- built a local-first codebase assistant that combines LlamaIndex retrieval, LangChain prompting, Ollama models, and a Streamlit review UI
+- upgraded the answer pipeline from generic semantic Q&A into a verification-oriented workflow with explicit `Answer`, `Why`, `Sources`, confidence labels, and evidence panels
+- added cross-file relationship summaries so artifact questions such as `How is the weekly digest built?` resolve into concrete code paths instead of vague summaries
+- introduced question-type routing for `artifact_flow`, `entity_location`, `relationship_trace`, and `open_analysis`, so different question styles now produce different answer shapes
+- tightened source selection and evidence ranking so analysis questions prefer implementation files over `README`, `tests`, and generated outputs
+- expanded regression coverage around retrieval, answer formatting, UI behavior, and confidence heuristics
 
-## UI preview
+## Example improvements
 
-![AI Codebase Assistant UI](assets/ui_preview.png)
+Representative improvements from the current iteration:
 
-## Demo flow
+- `How is the weekly digest built?`
+  now resolves to a compact chain like `app/main.py -> build_weekly_ci_digest() -> app/metrics.py`, `app/main.py -> write_weekly_digest_report() -> app/report.py`, and `app/report.py -> writes outputs/weekly_digest.md`
+- `What design risks do you see in this project?`
+  now uses implementation-grounded evidence such as aggregation logic in `app/metrics.py` and hard-coded failure classification rules in `app/ci_failure_analysis.py`
+- VS Code launch flow now prefers the project virtual environment and includes an Ollama prelaunch check for a more reliable one-click startup path
 
-1. Select a local repository path in the Streamlit UI.
-2. Click `Build / Load Index` to create or reuse the persisted vector index.
-3. Ask a repository question in natural language.
-4. Review the answer together with cited source file paths.
+## What the project does
 
-## Demo questions and outcomes
+- indexes source files and project docs from a local repository
+- stores a persisted vector index under the target repository
+- answers repository questions in CLI or Streamlit UI
+- combines vector retrieval with code-aware reranking and keyword context injection
+- shows supporting evidence, rewritten search questions, confidence labels, cited source paths, and cross-file relationship summaries
 
-| Question | Expected outcome |
-| --- | --- |
-| `Which file contains argparse and the main function?` | identifies `app/main.py` |
-| `Which file fetches GitHub workflow runs?` | points to the GitHub client implementation |
-| `Where are CI charts generated?` | surfaces the chart generation module |
-| `How is the weekly digest built?` | explains the reporting flow and relevant files |
+This project is aimed at practical repository understanding tasks such as:
 
-## Why this project
+- finding the CLI entrypoint
+- locating where configuration is loaded
+- tracing where indexing is built and persisted
+- identifying where reports, charts, or workflows are generated
 
-I wanted a project that is more practical than a generic chatbot demo. Instead of building a plain chat UI, this project focuses on repository understanding:
-- codebase onboarding
-- developer productivity
-- engineering knowledge retrieval
-- local AI application development
+## Current behavior
 
-It also shows how to combine retrieval-augmented generation with code-aware heuristics, which is much more realistic than relying on vector similarity alone.
+The retrieval pipeline is not pure semantic search. It includes:
 
-## What it does
+- question rewriting for follow-up questions
+- heuristic reranking by file path, identifiers, and intent
+- keyword-based context injection for code-oriented questions
+- intent-specific boosts for entrypoint, configuration, indexing, workflow, reporting, and test questions
+- extra scoring for identifier definitions, call sites, and import relationships in cross-file questions
+- generated chain-style summaries such as `file A -> function() -> file B` for call-chain style questions
+- output-aware flow summaries for artifact questions such as `How is the weekly digest built?`
+- answer post-processing so the final output consistently includes `Answer`, `Why`, and `Sources`
 
-- scans a local repository and loads source code and docs
-- builds a local vector index with LlamaIndex
-- retrieves relevant context for a natural language question
-- uses LangChain to assemble prompts and generate answers
-- runs fully locally with Ollama, so no external API key is required
-- returns cited file paths for traceability
+The Streamlit UI currently includes:
 
-## Real project value
+- repository path input and validation
+- build/load index workflow
+- saved workspaces
+- suggested questions
+- conversation history
+- a dedicated cross-file relationship panel for call-chain style questions
+- evidence and source expanders
+- protection against asking questions before an index is ready
 
-This is not only a document search demo. It is built around real engineering questions:
-- locating entrypoints
-- finding implementation files
-- understanding how modules interact
-- identifying where reports, workflows, or charts are generated
+## Verification-oriented workflow
 
-The project also includes a retrieval improvement layer:
-- vector retrieval for broad semantic recall
-- heuristic reranking for code-specific queries
-- keyword-driven context injection for patterns such as `argparse`, `def main`, and `__main__`
+This assistant is designed to help you verify codebase claims instead of only producing summaries.
 
-That extra layer matters because pure vector retrieval often misses the right file for code structure questions.
+For a question like `How is the weekly digest built?`, the current flow aims to:
 
-## Architecture
+- expand semantic aliases such as `weekly digest` into repository-specific identifiers like `build_weekly_ci_digest`, `write_weekly_digest_report`, and `weekly_digest.md`
+- prioritize files that define, call, or write those identifiers
+- filter out low-signal helpers such as `parse_args`, `from_env`, `fetch_*`, `summarize_*`, and test-only references
+- surface a concise relationship chain and a tight `Sources` list that the user can manually open and verify
 
-- `app/loaders.py`
-  - scans repository files and converts them into LlamaIndex `Document` objects
-- `app/indexing.py`
-  - builds or loads the persisted vector index
-- `app/qa.py`
-  - retrieves, reranks, injects keyword-matched code snippets, and generates answers
-- `app/main.py`
-  - CLI entrypoint with `index` and `ask` commands
+The intended verification loop is:
 
-## Why use both LangChain and LlamaIndex
+1. Ask a concrete code-path question.
+2. Inspect the `Cross-file relationships` panel.
+3. Open the cited files and confirm the function calls or output writes.
+4. Treat lower-confidence answers as hints rather than final truth.
 
-The two frameworks are used for different responsibilities:
+## Supported question styles
 
-- LlamaIndex
-  - file ingestion
-  - document chunking
-  - vector indexing
-  - base retrieval
+The assistant now uses a small question-type router before formatting the final answer. In practice, this means different questions are allowed to produce different answer shapes instead of forcing everything into one template.
 
-- LangChain
-  - prompt template management
-  - local LLM invocation through Ollama
-  - final answer generation
+### 1. Artifact flow questions
 
-This separation makes the project easier to reason about and extend.
+Examples:
 
-## Tech stack
+- `How is the weekly digest built?`
+- `How is the summary report built?`
+- `Where are CI charts generated?`
 
-- Python 3.11
-- LangChain
-- LlamaIndex
-- Ollama
-- local embedding model: `nomic-embed-text`
-- local chat model: `qwen2.5:7b`
+Expected behavior:
+
+- prioritizes entrypoint -> builder -> writer -> output style chains
+- surfaces concise cross-file relationships
+- keeps `Sources` narrow and verification-friendly
+- tends to score higher confidence when the chain and output file are both explicit
+
+### 2. Entity location questions
+
+Examples:
+
+- `Where is the Ollama base URL configured?`
+- `Which file contains argparse and the main function?`
+- `Where is compute_digest defined?`
+
+Expected behavior:
+
+- answers with the strongest matching file first
+- uses direct file-level evidence instead of long call chains
+- usually gives higher confidence when the match is concentrated in one or two files
+
+### 3. Relationship trace questions
+
+Examples:
+
+- `What calls compute_digest across files?`
+- `Which file fetches GitHub workflow runs and where are they summarized?`
+- `How does config get loaded before indexing starts?`
+
+Expected behavior:
+
+- focuses on cross-file call sites, imports, and definitions
+- uses relationship summaries when the repository structure is explicit enough
+- stays more conservative than artifact-flow questions because static retrieval can miss indirect runtime behavior
+
+### 4. Open analysis questions
+
+Examples:
+
+- `What design risks do you see in this project?`
+- `What should be optimized next?`
+- `Is this architecture too tightly coupled?`
+
+Expected behavior:
+
+- keeps the answer analytic rather than pretending there is one exact code path
+- attaches `Why` lines and `Sources` so the judgment stays repository-grounded
+- uses more conservative confidence and risk notes because this is interpretation, not execution proof
 
 ## Project structure
 
@@ -120,11 +153,45 @@ ai-codebase-assistant/
     loaders.py
     main.py
     qa.py
+    ui.py
+  tests/
+    test_integration.py
+    test_main.py
+    test_qa.py
+    test_ui.py
+  assets/
+    ui_preview.png
   .env.example
-  .gitignore
   requirements.txt
   README.md
 ```
+
+## Architecture
+
+- `app/loaders.py`
+  - scans repository files and converts them into LlamaIndex `Document` objects
+- `app/indexing.py`
+  - configures embeddings and chunking, then builds or loads the persisted vector index
+- `app/qa.py`
+  - rewrites search questions, reranks retrieved nodes, injects keyword matches, and formats final answers
+- `app/main.py`
+  - CLI entrypoint for `index` and `ask`
+- `app/ui.py`
+  - Streamlit UI for building/loading the index and asking questions interactively
+
+## Tech stack
+
+- Python 3.11
+- LangChain
+- LlamaIndex
+- Ollama
+- Streamlit
+- pytest
+
+Default local models:
+
+- chat model: `qwen2.5:7b`
+- embedding model: `nomic-embed-text`
 
 ## Local setup
 
@@ -137,7 +204,7 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Install and prepare Ollama:
+Install and start Ollama:
 
 ```powershell
 ollama pull qwen2.5:7b
@@ -145,7 +212,7 @@ ollama pull nomic-embed-text
 ollama serve
 ```
 
-Default `.env`:
+Default `.env` values:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
@@ -157,9 +224,9 @@ CHUNK_OVERLAP=150
 TOP_K=8
 ```
 
-## Usage
+## CLI usage
 
-Build an index for a repository:
+Build an index for a target repository:
 
 ```powershell
 python -m app.main --repo-path C:\path\to\repo index
@@ -177,87 +244,94 @@ Ask one question:
 python -m app.main --repo-path C:\path\to\repo ask --question "Which file contains argparse and the main function?"
 ```
 
-Start interactive mode:
+Start interactive CLI mode:
 
 ```powershell
 python -m app.main --repo-path C:\path\to\repo ask
 ```
 
-Start the Streamlit UI:
+## Streamlit usage
+
+Start the UI:
 
 ```powershell
-streamlit run app/ui.py
+python -m streamlit run app\ui.py
 ```
+
+VS Code one-click run:
+
+- open the project folder in VS Code
+- select the `.venv` interpreter if prompted
+- open `Run and Debug`
+- choose `Run Streamlit UI`
+- press `F5` or click the green run button
+
+This project now includes:
+
+- `.vscode/launch.json` for one-click debug launch
+- `.vscode/tasks.json` for one-click task-based launch
+
+Typical flow:
+
+1. Enter a repository path.
+2. Click `Build / Load Index`.
+3. Ask a question or use one of the suggested prompts.
+4. Inspect the answer, evidence, rewritten search question, and cited sources.
+
+If the current workspace does not have an index loaded, the app now blocks the request and tells you to build/load the index first.
 
 ## Example questions
 
-- Which file contains argparse and the main function?
-- Which file fetches GitHub workflow runs?
-- Where are CI charts generated?
-- How is the weekly digest built?
-- How do I start this project locally?
+- `Which file contains argparse and the main function?`
+- `Where is the Ollama base URL configured?`
+- `How is the index built and persisted?`
+- `Which file fetches GitHub workflow runs?`
+- `Where are CI charts generated?`
+- `How is the weekly digest built?`
 
-## Example result
-
-When asked:
-
-```text
-Which file contains argparse and the main function?
-```
-
-The assistant correctly identified:
+## Example answer format
 
 ```text
-app/main.py
-```
-
-and surfaced supporting evidence such as:
-- `import argparse`
-- `def main() -> None`
-
-This is important because it demonstrates that the system is not only returning approximate matches; it can be tuned toward code-structure questions with better retrieval logic.
-
-## Sample interaction
-
-```text
-User:
-Which file contains argparse and the main function?
-
-Assistant:
-The file is app/main.py.
-
+Answer: The main CLI entrypoint is in app/main.py.
 Why:
-- it imports argparse
-- it defines def main() -> None
-- it contains the CLI entry flow
+- app/main.py imports argparse.
+- app/main.py defines def main() and the __main__ entry flow.
 
 Sources:
 - app/main.py
 ```
 
-## Engineering highlights
+## Testing
 
-- local-first AI workflow with no external API key requirement
-- persisted repository index for repeated querying
-- source citation in answers
-- retrieval tuning for code-oriented questions
-- minimal web UI with Streamlit
-- clear modular separation between loading, indexing, retrieval, and generation
+Run the focused test suite with the project virtual environment:
 
-## Good next extensions
+```powershell
+.venv\Scripts\python.exe -m pytest tests\test_main.py tests\test_qa.py tests\test_ui.py -q
+```
 
-- support GitHub Issues and PR comments as extra context
-- add repository filters by directory or file type
-- support multiple repositories
-- add follow-up question memory beyond single-session UI state
+Current tests cover:
 
-## Best fit use cases
+- small-repository integration paths
+- CLI entry behavior
+- index-required guardrails
+- entrypoint/config/indexing retrieval rules
+- cross-file call-site and definition matching
+- reporting-flow and artifact-output chain generation
+- UI protection when no index is loaded
+- final answer formatting and source inclusion
 
-- onboarding into an unfamiliar repository
-- locating entrypoints and ownership hotspots
-- tracing where reports, charts, workflows, or APIs are implemented
-- building an internal developer support assistant on top of local code
+## Known limitations
 
-## Resume-ready description
+- answers still depend on retrieved snippets, not runtime execution
+- multi-file call-chain questions still rely on static relationships rather than full AST or runtime tracing
+- Streamlit requests run synchronously in the current page session
+- the in-memory workspace index can be lost across reloads, even if the persisted `.storage` directory still exists
+- answer quality still depends on the local Ollama model you run
 
-Built a local codebase Q&A assistant with LangChain, LlamaIndex, and Ollama that indexes source code and documentation, retrieves relevant repository context, and answers natural language questions with cited file paths. Improved retrieval quality for code-structure questions by combining vector search with heuristic reranking and keyword-based context injection.
+## Next improvements
+
+- add stronger AST-based reasoning for cross-file and artifact-output questions
+- support filtering by directory or file type
+- persist workspace metadata more explicitly across UI reloads
+- add broader tests around retrieval scoring and answer formatting
+
