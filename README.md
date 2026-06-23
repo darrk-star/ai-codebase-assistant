@@ -1,87 +1,100 @@
 # AI Codebase Assistant
 
-AI Codebase Assistant is a local-first repository Q&A tool that helps users understand a codebase with source-grounded answers.
+AI Codebase Assistant is a local-first codebase analysis assistant that indexes a checked-out repository, retrieves relevant implementation files, and answers natural-language questions with explicit `Answer`, `Why`, `Sources`, confidence labels, evidence panels, and cross-file relationship summaries.
 
-It indexes a local repository, retrieves relevant implementation files, and answers natural-language questions with explicit file citations, confidence labels, evidence panels, and cross-file relationship summaries.
+Built with LangChain, LlamaIndex, Ollama, and Streamlit, it is designed for repository understanding and verification rather than generic AI summarization.
 
-The project is built with LangChain, LlamaIndex, Ollama, and Streamlit, and is designed for practical repository inspection rather than generic AI summarization.
+## Overview
 
-## What this project does
+This project helps users ask questions about a local repository and get answers that are easier to verify in real files.
 
-This assistant helps users ask questions about a local codebase and get answers that are easier to verify in real files.
+It is useful for tasks such as:
 
-It supports tasks like:
+- retrieving real implementation files from a checked-out repository
+- locating functions, configuration, and entrypoints
+- tracing relationships across multiple files
+- explaining how reports, charts, or output artifacts are generated
+- surfacing implementation evidence instead of relying on free-form summaries
+
+## Features
+
+- source-grounded repository Q&A with explicit file citations
+- cross-file relationship tracing for definitions, callers, imports, and output writers
+- artifact-flow explanation for questions about reports, digests, charts, and generated files
+- evidence-aware design analysis with conservative confidence behavior
+- Streamlit review UI with evidence panels, source lists, saved workspaces, and suggested prompts
+
+## Example questions
+
+The assistant is designed for practical repository inspection tasks such as:
 
 - finding where a function, config, or entrypoint is defined
 - tracing how data or logic moves across multiple files
 - explaining how a report, chart, or output file is generated
-- giving cautious design-risk analysis based on retrieved implementation evidence
+- identifying where a workflow starts, which functions build the result, and which file writes the final artifact
+- giving cautious design-risk analysis based on implementation evidence
 
-## Main features
-
-### 1. Source-grounded Q&A
-
-The assistant answers repository questions with cited source files instead of only giving a free-form summary.
-
-Example questions:
+Example prompts:
 
 - `Which file contains argparse and the main function?`
 - `Where is the Ollama base URL configured?`
 - `How is the index built and persisted?`
+- `What calls compute_digest across files?`
+- `How is the weekly digest built?`
+- `What design risks do you see in this project?`
 
-### 2. Cross-file tracing
+## Recent improvements
 
-It can trace relationships across files when a question depends on definitions, imports, callers, or output writers.
+Recent changes focus on making answers more verifiable and easier to inspect in the local codebase.
 
-Example questions:
+Main improvements:
+
+- upgraded answer formatting to expose explicit `Answer`, `Why`, and `Sources`
+- added confidence labels and evidence panels
+- introduced question-type routing so different question styles produce different answer shapes
+- improved artifact-flow tracing for report and output questions
+- improved cross-file relationship summaries for implementation tracing
+- reduced noisy sources in open-ended analysis answers
+- improved VS Code startup flow with virtual environment support and Ollama checks
+
+## Supported question styles
+
+### 1. Entity location
+
+Best for questions that need the strongest matching file or definition point.
+
+Examples:
+
+- `Which file contains argparse and the main function?`
+- `Where is the Ollama base URL configured?`
+- `Where is compute_digest defined?`
+
+### 2. Relationship trace
+
+Best for questions about definitions, callers, imports, or multi-file interactions.
+
+Examples:
 
 - `What calls compute_digest across files?`
 - `Which file fetches GitHub workflow runs and where are they summarized?`
 
-### 3. Artifact-flow explanation
+### 3. Artifact flow
 
-It can explain how a specific artifact is produced by following builder and writer logic.
+Best for questions about how a report, digest, chart, or output file is produced.
 
-Example questions:
+Examples:
 
 - `How is the weekly digest built?`
 - `Where are CI charts generated?`
 
-### 4. Evidence-aware analysis
+### 4. Open analysis
 
-For broader design questions, the assistant gives a more conservative answer and tries to ground its reasoning in implementation evidence.
+Best for design judgment or optimization questions that need implementation-grounded reasoning.
 
-Example questions:
+Examples:
 
 - `What design risks do you see in this project?`
 - `What should be optimized next?`
-
-### 5. Streamlit UI
-
-The project includes a local Streamlit interface for interactive use.
-
-The UI supports:
-
-- repository path input
-- build/load index flow
-- saved workspaces
-- suggested questions
-- conversation history
-- evidence and source panels
-- confidence display
-- cross-file relationship display
-
-## Recent improvements
-
-The latest version improves the project in several ways:
-
-- added clearer answer formatting with `Answer`, `Why`, and `Sources`
-- added confidence labels and evidence panels
-- improved artifact-flow tracing for report and output questions
-- improved cross-file relationship summaries
-- added question-type routing for different kinds of questions
-- reduced noisy sources in open-ended analysis answers
-- improved VS Code startup flow with virtual environment support and Ollama checks
 
 ## Example improvement
 
@@ -99,7 +112,7 @@ app/main.py -> write_weekly_digest_report() -> app/report.py
 app/report.py -> writes outputs/weekly_digest.md
 ```
 
-This makes it easier for a user to open the files and verify the answer manually.
+This makes it easier for a user to open the cited files and verify the answer manually.
 
 ## Project structure
 
@@ -154,7 +167,7 @@ Important modules:
 
 - `app/loaders.py`: loads repository files into documents
 - `app/indexing.py`: builds or loads the vector index
-- `app/qa.py`: handles retrieval, reranking, answer formatting, and evidence logic
+- `app/qa.py`: handles retrieval, reranking, answer formatting, evidence logic, and cross-file summaries
 - `app/main.py`: CLI entrypoint
 - `app/ui.py`: Streamlit UI
 
@@ -275,17 +288,6 @@ Recommended flow:
 3. open `Run and Debug`
 4. choose `Run Streamlit UI`
 5. press `F5`
-
-## Example questions
-
-- `Which file contains argparse and the main function?`
-- `Where is the Ollama base URL configured?`
-- `How is the index built and persisted?`
-- `Which file fetches GitHub workflow runs?`
-- `Where are CI charts generated?`
-- `How is the weekly digest built?`
-- `What calls compute_digest across files?`
-- `What design risks do you see in this project?`
 
 ## Example answer format
 
