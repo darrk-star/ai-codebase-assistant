@@ -362,4 +362,4 @@ question-answering
 
 ## License
 
-This repository does not currently include a license file.
+This project is licensed under the MIT License. See the `LICENSE` file for details.
