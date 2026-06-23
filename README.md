@@ -1,5 +1,7 @@
 # AI Codebase Assistant
 
+![AI Codebase Assistant UI preview](assets/ui_preview.png)
+
 AI Codebase Assistant is a local-first codebase analysis assistant that indexes a checked-out repository, retrieves relevant implementation files, and answers natural-language questions with explicit `Answer`, `Why`, `Sources`, confidence labels, evidence panels, and cross-file relationship summaries.
 
 Built with LangChain, LlamaIndex, Ollama, and Streamlit, it is designed for repository understanding and verification rather than generic AI summarization.
@@ -153,6 +155,17 @@ Default local models:
 
 - chat model: `qwen2.5:7b`
 - embedding model: `nomic-embed-text`
+
+## Requirements
+
+Before running the project locally, make sure you have:
+
+- Python 3.11 installed
+- Ollama installed and available on your system path
+- the required local models downloaded:
+  - `qwen2.5:7b`
+  - `nomic-embed-text`
+- a local repository path that you want to index and inspect
 
 ## How it works
 
@@ -346,3 +359,7 @@ developer-tools
 repository-analysis
 question-answering
 ```
+
+## License
+
+This repository does not currently include a license file.
