@@ -199,12 +199,63 @@ def test_render_message_content_keeps_user_messages_unchanged(monkeypatch) -> No
 
 
 def test_suggested_questions_cover_multiple_question_types() -> None:
-    prompts = ui.SUGGESTED_QUESTIONS
+    prompts = ui.DEFAULT_SUGGESTED_QUESTIONS
 
     assert "How is the weekly digest built?" in prompts
     assert "Where is the Ollama base URL configured?" in prompts
     assert "What calls summarize_workflow_runs across files?" in prompts
     assert "What design risks do you see in this project?" in prompts
+
+
+def test_suggested_questions_for_repo_uses_detected_repo_signals(tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text(
+        "import argparse\n"
+        "from app.github_client import GitHubClient\n"
+        "from app.metrics import summarize_workflow_runs\n"
+        "from app.report import write_weekly_digest_report, write_markdown_report\n"
+        "from app.charts import write_failure_trend_chart\n"
+        "def main():\n"
+        "    summarize_workflow_runs([])\n"
+        "    write_weekly_digest_report('outputs/weekly_digest.md', 'repo', 7, {})\n",
+        encoding="utf-8",
+    )
+    (app_dir / "config.py").write_text("OLLAMA_BASE_URL = 'http://localhost:11434'\n", encoding="utf-8")
+    (app_dir / "metrics.py").write_text(
+        "def summarize_workflow_runs(records):\n"
+        "    category_counts = {}\n"
+        "    workflow_failures = {}\n"
+        "    return category_counts, workflow_failures\n",
+        encoding="utf-8",
+    )
+    (app_dir / "github_client.py").write_text("def fetch_workflow_runs():\n    return []\n", encoding="utf-8")
+    (app_dir / "report.py").write_text(
+        "def write_weekly_digest_report(*args):\n    return 'outputs/weekly_digest.md'\n"
+        "def write_markdown_report(*args):\n    return 'outputs/summary.md'\n",
+        encoding="utf-8",
+    )
+    (app_dir / "charts.py").write_text("def write_failure_trend_chart(*args):\n    return True\n", encoding="utf-8")
+    (app_dir / "ci_failure_analysis.py").write_text("patterns = [('unknown_failure', ['error'])]\n", encoding="utf-8")
+
+    ui._suggested_questions_for_repo.cache_clear()
+    prompts = ui._suggested_questions_for_repo(tmp_path)
+
+    assert prompts[0] == "How is the weekly digest built?"
+    assert prompts[1] == "Which file fetches GitHub workflow runs and where are they summarized?"
+    assert prompts[2] == "What calls summarize_workflow_runs across files?"
+    assert "Which file contains argparse and the main function?" in prompts
+    assert "Where is the Ollama base URL configured?" in prompts
+    assert "How is the summary report built?" in prompts
+    assert "Where are CI charts generated?" in prompts
+    assert "What design risks do you see in this project?" in prompts
+
+
+def test_suggested_questions_for_repo_falls_back_to_defaults(tmp_path: Path) -> None:
+    ui._suggested_questions_for_repo.cache_clear()
+    prompts = ui._suggested_questions_for_repo(tmp_path)
+
+    assert prompts == ui.DEFAULT_SUGGESTED_QUESTIONS
 
 
 def test_queue_question_stores_pending_prompt_and_user_message(monkeypatch, tmp_path: Path) -> None:

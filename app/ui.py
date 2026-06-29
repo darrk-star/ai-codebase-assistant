@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 import re
 import sys
@@ -19,7 +20,7 @@ from app.qa import answer_question
 load_dotenv()
 
 
-SUGGESTED_QUESTIONS = (
+DEFAULT_SUGGESTED_QUESTIONS = (
     "How is the weekly digest built?",
     "How is the summary report built?",
     "Where is the Ollama base URL configured?",
@@ -164,7 +165,8 @@ def main() -> None:
 
     st.markdown("### Suggested questions")
     q_col1, q_col2 = st.columns(2, gap="large")
-    for idx, prompt in enumerate(SUGGESTED_QUESTIONS):
+    suggested_questions = _suggested_questions_for_repo(repo_path)
+    for idx, prompt in enumerate(suggested_questions):
         target_column = q_col1 if idx % 2 == 0 else q_col2
         with target_column:
             if st.button(
@@ -283,6 +285,110 @@ def _render_message_content(content: str, role: str) -> None:
     body = re.split(r"\n\s*Sources:\s*\n", content, maxsplit=1)[0].strip()
     body = body.replace("\nWhy:\n", "\n\nWhy:\n\n")
     st.markdown(body)
+
+
+@lru_cache(maxsize=16)
+def _suggested_questions_for_repo(repo_path: Path) -> tuple[str, ...]:
+    repo_root = Path(repo_path).resolve()
+    if not repo_root.exists() or not repo_root.is_dir():
+        return DEFAULT_SUGGESTED_QUESTIONS
+
+    app_dir = repo_root / "app"
+    main_path = app_dir / "main.py"
+    config_path = app_dir / "config.py"
+    metrics_path = app_dir / "metrics.py"
+    github_client_path = app_dir / "github_client.py"
+    report_path = app_dir / "report.py"
+    charts_path = app_dir / "charts.py"
+
+    prompt_scores: dict[str, int] = {}
+
+    def add_prompt(prompt: str, score: int) -> None:
+        if not prompt.strip():
+            return
+        existing = prompt_scores.get(prompt)
+        if existing is None or score > existing:
+            prompt_scores[prompt] = score
+
+    if _file_contains(main_path, ("argparse", "ArgumentParser", "def main(")):
+        add_prompt("Which file contains argparse and the main function?", 60)
+
+    config_target = _pick_first_identifier(
+        config_path,
+        ("OLLAMA_BASE_URL", "ollama_base_url", "OLLAMA_CHAT_MODEL"),
+    )
+    if config_target:
+        if "base_url" in config_target.lower():
+            add_prompt("Where is the Ollama base URL configured?", 80)
+        else:
+            add_prompt(f"Where is `{config_target}` configured?", 70)
+
+    relationship_target = _pick_first_identifier(
+        metrics_path,
+        ("summarize_workflow_runs", "build_weekly_ci_digest", "summarize_pull_requests"),
+    )
+    if relationship_target:
+        relationship_score = 90 if relationship_target == "summarize_workflow_runs" else 75
+        add_prompt(f"What calls {relationship_target} across files?", relationship_score)
+
+    if _file_contains(github_client_path, ("fetch_workflow_runs",)) and _file_contains(metrics_path, ("summarize_workflow_runs",)):
+        add_prompt("Which file fetches GitHub workflow runs and where are they summarized?", 95)
+
+    if _file_contains(report_path, ("write_weekly_digest_report", "weekly_digest.md")):
+        add_prompt("How is the weekly digest built?", 100)
+
+    if _file_contains(report_path, ("write_markdown_report", "summary.md")):
+        add_prompt("How is the summary report built?", 85)
+
+    if _file_contains(charts_path, ("write_failure_trend_chart", "write_failed_workflow_chart")):
+        add_prompt("Where are CI charts generated?", 65)
+
+    if _file_contains(metrics_path, ("category_counts", "workflow_failures")) or _file_contains(
+        repo_root / "app" / "ci_failure_analysis.py",
+        ("patterns", "permission_failure", "unknown_failure"),
+    ):
+        add_prompt("What design risks do you see in this project?", 88)
+
+    merged = [
+        prompt
+        for prompt, _ in sorted(
+            prompt_scores.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+    if not merged:
+        return DEFAULT_SUGGESTED_QUESTIONS
+    for fallback in DEFAULT_SUGGESTED_QUESTIONS:
+        if fallback not in merged:
+            merged.append(fallback)
+        if len(merged) >= 8:
+            break
+    return tuple(merged[:8])
+
+
+def _file_contains(path: Path, patterns: tuple[str, ...]) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+    return any(pattern in text for pattern in patterns)
+
+
+def _pick_first_identifier(path: Path, candidates: tuple[str, ...]) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return ""
+    for candidate in candidates:
+        if candidate in text:
+            return candidate
+    return ""
 
 
 def _get_active_repo(default_repo: str) -> str:
