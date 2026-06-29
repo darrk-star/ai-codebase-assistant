@@ -1004,6 +1004,45 @@ def test_confidence_score_boosts_focused_entity_location_answers() -> None:
     assert score >= 70
 
 
+def test_confidence_score_boosts_relationship_answers_with_caller_and_definition() -> None:
+    score = qa._confidence_score(
+        source_paths=["app/main.py", "app/metrics.py"],
+        evidence_blocks=[
+            {
+                "file_path": "app/main.py",
+                "reason": "Identifier call-site match",
+                "snippet": "workflow_summary = summarize_workflow_runs(workflow_records)",
+            },
+            {
+                "file_path": "app/metrics.py",
+                "reason": "Identifier definition match",
+                "snippet": "def summarize_workflow_runs(records):\n    return records",
+            },
+        ],
+        question="What calls summarize_workflow_runs across files?",
+        search_question="What calls summarize_workflow_runs across files?",
+    )
+
+    assert score >= 70
+    assert qa._confidence_label(
+        ["app/main.py", "app/metrics.py"],
+        [
+            {
+                "file_path": "app/main.py",
+                "reason": "Identifier call-site match",
+                "snippet": "workflow_summary = summarize_workflow_runs(workflow_records)",
+            },
+            {
+                "file_path": "app/metrics.py",
+                "reason": "Identifier definition match",
+                "snippet": "def summarize_workflow_runs(records):\n    return records",
+            },
+        ],
+        "What calls summarize_workflow_runs across files?",
+        "What calls summarize_workflow_runs across files?",
+    ) == "High confidence"
+
+
 def test_confidence_score_keeps_open_analysis_more_conservative() -> None:
     score = qa._confidence_score(
         source_paths=["app/main.py", "app/qa.py", "README.md"],

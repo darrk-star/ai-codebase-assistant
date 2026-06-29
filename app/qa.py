@@ -1907,6 +1907,18 @@ def _confidence_score(
     )
     has_output_source = any(path.startswith("outputs/") for path in source_lower)
     focused_python_sources = [path for path in source_lower if path.endswith(".py")]
+    identifiers = _extract_identifier_terms(question)
+    relationship_definition_hits = 0
+    relationship_call_hits = 0
+    if question_type == "relationship_trace" and identifiers:
+        for item in evidence_blocks:
+            snippet_lower = str(item.get("snippet", "")).lower()
+            for identifier in identifiers:
+                normalized = identifier.lower()
+                if f"def {normalized}" in snippet_lower:
+                    relationship_definition_hits += 1
+                if f"{normalized}(" in snippet_lower and f"def {normalized}" not in snippet_lower:
+                    relationship_call_hits += 1
 
     if evidence_blocks:
         score += min(len(evidence_blocks), 3) * 8
@@ -1938,6 +1950,12 @@ def _confidence_score(
         score += 10
     if question_type == "relationship_trace" and 2 <= len(source_paths) <= 3:
         score += 4
+    if question_type == "relationship_trace" and relationship_definition_hits:
+        score += 8
+    if question_type == "relationship_trace" and relationship_call_hits:
+        score += 8
+    if question_type == "relationship_trace" and relationship_definition_hits and relationship_call_hits:
+        score += 6
     if question_type == "open_analysis":
         score -= 8
 

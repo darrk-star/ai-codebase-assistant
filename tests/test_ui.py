@@ -251,6 +251,46 @@ def test_suggested_questions_for_repo_uses_detected_repo_signals(tmp_path: Path)
     assert "What design risks do you see in this project?" in prompts
 
 
+def test_build_repo_profile_extracts_core_repo_signals(tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text(
+        "import argparse\n"
+        "from app.metrics import summarize_workflow_runs\n"
+        "def main():\n"
+        "    summarize_workflow_runs([])\n",
+        encoding="utf-8",
+    )
+    (app_dir / "config.py").write_text("OLLAMA_BASE_URL = 'http://localhost:11434'\n", encoding="utf-8")
+    (app_dir / "metrics.py").write_text(
+        "def summarize_workflow_runs(records):\n"
+        "    category_counts = {}\n"
+        "    workflow_failures = {}\n"
+        "    return category_counts, workflow_failures\n",
+        encoding="utf-8",
+    )
+    (app_dir / "github_client.py").write_text("def fetch_workflow_runs():\n    return []\n", encoding="utf-8")
+    (app_dir / "report.py").write_text(
+        "def write_weekly_digest_report(*args):\n    return 'outputs/weekly_digest.md'\n"
+        "def write_markdown_report(*args):\n    return 'outputs/summary.md'\n",
+        encoding="utf-8",
+    )
+    (app_dir / "charts.py").write_text("def write_failure_trend_chart(*args):\n    return True\n", encoding="utf-8")
+    (app_dir / "ci_failure_analysis.py").write_text("patterns = [('unknown_failure', ['error'])]\n", encoding="utf-8")
+
+    ui._build_repo_profile.cache_clear()
+    profile = ui._build_repo_profile(tmp_path)
+
+    assert profile["has_entrypoint"] is True
+    assert profile["config_target"] == "OLLAMA_BASE_URL"
+    assert profile["relationship_target"] == "summarize_workflow_runs"
+    assert profile["has_workflow_fetch_and_summary"] is True
+    assert profile["has_weekly_digest"] is True
+    assert profile["has_summary_report"] is True
+    assert profile["has_ci_charts"] is True
+    assert profile["has_design_risk_signals"] is True
+
+
 def test_suggested_questions_for_repo_falls_back_to_defaults(tmp_path: Path) -> None:
     ui._suggested_questions_for_repo.cache_clear()
     prompts = ui._suggested_questions_for_repo(tmp_path)

@@ -31,6 +31,10 @@ DEFAULT_SUGGESTED_QUESTIONS = (
     "What design risks do you see in this project?",
 )
 
+
+class RepoProfile(dict[str, object]):
+    pass
+
 APP_BUILD_TAG = "relationship-filter-v5"
 
 STOP_BUTTON_CSS = """
@@ -289,17 +293,9 @@ def _render_message_content(content: str, role: str) -> None:
 
 @lru_cache(maxsize=16)
 def _suggested_questions_for_repo(repo_path: Path) -> tuple[str, ...]:
-    repo_root = Path(repo_path).resolve()
-    if not repo_root.exists() or not repo_root.is_dir():
+    profile = _build_repo_profile(repo_path)
+    if not profile:
         return DEFAULT_SUGGESTED_QUESTIONS
-
-    app_dir = repo_root / "app"
-    main_path = app_dir / "main.py"
-    config_path = app_dir / "config.py"
-    metrics_path = app_dir / "metrics.py"
-    github_client_path = app_dir / "github_client.py"
-    report_path = app_dir / "report.py"
-    charts_path = app_dir / "charts.py"
 
     prompt_scores: dict[str, int] = {}
 
@@ -310,43 +306,34 @@ def _suggested_questions_for_repo(repo_path: Path) -> tuple[str, ...]:
         if existing is None or score > existing:
             prompt_scores[prompt] = score
 
-    if _file_contains(main_path, ("argparse", "ArgumentParser", "def main(")):
+    if profile.get("has_entrypoint"):
         add_prompt("Which file contains argparse and the main function?", 60)
 
-    config_target = _pick_first_identifier(
-        config_path,
-        ("OLLAMA_BASE_URL", "ollama_base_url", "OLLAMA_CHAT_MODEL"),
-    )
+    config_target = str(profile.get("config_target", "")).strip()
     if config_target:
         if "base_url" in config_target.lower():
             add_prompt("Where is the Ollama base URL configured?", 80)
         else:
             add_prompt(f"Where is `{config_target}` configured?", 70)
 
-    relationship_target = _pick_first_identifier(
-        metrics_path,
-        ("summarize_workflow_runs", "build_weekly_ci_digest", "summarize_pull_requests"),
-    )
+    relationship_target = str(profile.get("relationship_target", "")).strip()
     if relationship_target:
         relationship_score = 90 if relationship_target == "summarize_workflow_runs" else 75
         add_prompt(f"What calls {relationship_target} across files?", relationship_score)
 
-    if _file_contains(github_client_path, ("fetch_workflow_runs",)) and _file_contains(metrics_path, ("summarize_workflow_runs",)):
+    if profile.get("has_workflow_fetch_and_summary"):
         add_prompt("Which file fetches GitHub workflow runs and where are they summarized?", 95)
 
-    if _file_contains(report_path, ("write_weekly_digest_report", "weekly_digest.md")):
+    if profile.get("has_weekly_digest"):
         add_prompt("How is the weekly digest built?", 100)
 
-    if _file_contains(report_path, ("write_markdown_report", "summary.md")):
+    if profile.get("has_summary_report"):
         add_prompt("How is the summary report built?", 85)
 
-    if _file_contains(charts_path, ("write_failure_trend_chart", "write_failed_workflow_chart")):
+    if profile.get("has_ci_charts"):
         add_prompt("Where are CI charts generated?", 65)
 
-    if _file_contains(metrics_path, ("category_counts", "workflow_failures")) or _file_contains(
-        repo_root / "app" / "ci_failure_analysis.py",
-        ("patterns", "permission_failure", "unknown_failure"),
-    ):
+    if profile.get("has_design_risk_signals"):
         add_prompt("What design risks do you see in this project?", 88)
 
     merged = [
@@ -364,6 +351,41 @@ def _suggested_questions_for_repo(repo_path: Path) -> tuple[str, ...]:
         if len(merged) >= 8:
             break
     return tuple(merged[:8])
+
+
+@lru_cache(maxsize=16)
+def _build_repo_profile(repo_path: Path) -> RepoProfile:
+    repo_root = Path(repo_path).resolve()
+    if not repo_root.exists() or not repo_root.is_dir():
+        return RepoProfile()
+
+    app_dir = repo_root / "app"
+    main_path = app_dir / "main.py"
+    config_path = app_dir / "config.py"
+    metrics_path = app_dir / "metrics.py"
+    github_client_path = app_dir / "github_client.py"
+    report_path = app_dir / "report.py"
+    charts_path = app_dir / "charts.py"
+    risk_path = repo_root / "app" / "ci_failure_analysis.py"
+
+    return RepoProfile(
+        has_entrypoint=_file_contains(main_path, ("argparse", "ArgumentParser", "def main(")),
+        config_target=_pick_first_identifier(
+            config_path,
+            ("OLLAMA_BASE_URL", "ollama_base_url", "OLLAMA_CHAT_MODEL"),
+        ),
+        relationship_target=_pick_first_identifier(
+            metrics_path,
+            ("summarize_workflow_runs", "build_weekly_ci_digest", "summarize_pull_requests"),
+        ),
+        has_workflow_fetch_and_summary=_file_contains(github_client_path, ("fetch_workflow_runs",))
+        and _file_contains(metrics_path, ("summarize_workflow_runs",)),
+        has_weekly_digest=_file_contains(report_path, ("write_weekly_digest_report", "weekly_digest.md")),
+        has_summary_report=_file_contains(report_path, ("write_markdown_report", "summary.md")),
+        has_ci_charts=_file_contains(charts_path, ("write_failure_trend_chart", "write_failed_workflow_chart")),
+        has_design_risk_signals=_file_contains(metrics_path, ("category_counts", "workflow_failures"))
+        or _file_contains(risk_path, ("patterns", "permission_failure", "unknown_failure")),
+    )
 
 
 def _file_contains(path: Path, patterns: tuple[str, ...]) -> bool:
