@@ -6,6 +6,15 @@ AI Codebase Assistant is a local-first codebase analysis assistant that indexes 
 
 Built with LangChain, LlamaIndex, Ollama, and Streamlit, it is designed for repository understanding and verification rather than generic AI summarization.
 
+## Highlights
+
+- source-grounded repository Q&A with explicit file citations
+- cross-file relationship tracing for callers, definitions, imports, and output writers
+- artifact-flow explanations for digests, reports, charts, and generated files
+- implementation-backed design analysis with conservative confidence labels
+- Streamlit UI with saved workspaces, evidence panels, and repo-specific suggested prompts
+- VS Code one-click startup with the project virtual environment and fixed Streamlit port
+
 ## Overview
 
 This project helps users ask questions about a local repository and get answers that are easier to verify in real files.
@@ -17,14 +26,6 @@ It is useful for tasks such as:
 - tracing relationships across multiple files
 - explaining how reports, charts, or output artifacts are generated
 - surfacing implementation evidence instead of relying on free-form summaries
-
-## Features
-
-- source-grounded repository Q&A with explicit file citations
-- cross-file relationship tracing for definitions, callers, imports, and output writers
-- artifact-flow explanation for questions about reports, digests, charts, and generated files
-- evidence-aware design analysis with conservative confidence behavior
-- Streamlit review UI with evidence panels, source lists, saved workspaces, and suggested prompts
 
 ## Example questions
 
@@ -41,23 +42,20 @@ Example prompts:
 - `Which file contains argparse and the main function?`
 - `Where is the Ollama base URL configured?`
 - `How is the index built and persisted?`
-- `What calls compute_digest across files?`
+- `What calls summarize_workflow_runs across files?`
 - `How is the weekly digest built?`
 - `What design risks do you see in this project?`
 
-## Recent improvements
+## What changed recently
 
-Recent changes focus on making answers more verifiable and easier to inspect in the local codebase.
-
-Main improvements:
+Recent updates focused on making answers easier to verify in real files:
 
 - upgraded answer formatting to expose explicit `Answer`, `Why`, and `Sources`
-- added confidence labels and evidence panels
-- introduced question-type routing so different question styles produce different answer shapes
+- added confidence labels and expandable evidence panels
 - improved artifact-flow tracing for report and output questions
-- improved cross-file relationship summaries for implementation tracing
-- reduced noisy sources in open-ended analysis answers
-- improved VS Code startup flow with virtual environment support and Ollama checks
+- improved cross-file relationship answers so they point to real caller/definition files
+- aligned suggested prompts with the currently indexed repository instead of stale demo identifiers
+- improved VS Code startup flow with virtual environment support, a fixed Streamlit port, and Ollama checks
 
 ## Supported question styles
 
@@ -69,7 +67,7 @@ Examples:
 
 - `Which file contains argparse and the main function?`
 - `Where is the Ollama base URL configured?`
-- `Where is compute_digest defined?`
+- `Where is summarize_workflow_runs defined?`
 
 ### 2. Relationship trace
 
@@ -77,7 +75,7 @@ Best for questions about definitions, callers, imports, or multi-file interactio
 
 Examples:
 
-- `What calls compute_digest across files?`
+- `What calls summarize_workflow_runs across files?`
 - `Which file fetches GitHub workflow runs and where are they summarized?`
 
 ### 3. Artifact flow
@@ -136,6 +134,7 @@ ai-codebase-assistant/
     ui_preview.png
   .vscode/
     launch.json
+    settings.json
     tasks.json
   .env.example
   requirements.txt
@@ -183,6 +182,17 @@ Important modules:
 - `app/qa.py`: handles retrieval, reranking, answer formatting, evidence logic, and cross-file summaries
 - `app/main.py`: CLI entrypoint
 - `app/ui.py`: Streamlit UI
+
+## Quick start
+
+If you only want to get the UI running locally:
+
+1. create and activate a virtual environment
+2. install dependencies with `pip install -r requirements.txt`
+3. copy `.env.example` to `.env`
+4. pull the Ollama models
+5. start the UI with `python -m streamlit run app\ui.py --server.port 8502`
+6. open `http://localhost:8502`
 
 ## Local setup
 
@@ -268,13 +278,13 @@ python -m app.main --repo-path C:\path\to\repo ask
 Start the UI:
 
 ```powershell
-python -m streamlit run app\ui.py
+python -m streamlit run app\ui.py --server.port 8502
 ```
 
 Then open:
 
 ```text
-http://localhost:8501
+http://localhost:8502
 ```
 
 Typical workflow:
@@ -292,28 +302,23 @@ This project includes VS Code launch files for easier startup.
 Files included:
 
 - `.vscode/launch.json`
+- `.vscode/settings.json`
 - `.vscode/tasks.json`
 
 Recommended flow:
 
 1. open the project folder in VS Code
-2. select the project Python interpreter
+2. let VS Code use the project interpreter from `.vscode/settings.json`, or manually select `.venv\Scripts\python.exe`
 3. open `Run and Debug`
 4. choose `Run Streamlit UI`
 5. press `F5`
 
-## Example answer format
+What the VS Code setup does now:
 
-```text
-Answer: The main CLI entrypoint is in app/main.py.
-
-Why:
-- app/main.py imports argparse.
-- app/main.py defines def main() and the __main__ entry flow.
-
-Sources:
-- app/main.py
-```
+- starts Streamlit with the project virtual environment instead of the system Python
+- uses a fixed port `8502`
+- keeps the launch profile and task profile aligned
+- checks that Ollama is running before the UI starts
 
 ## Testing
 
@@ -328,6 +333,7 @@ Run tests with:
 - answers depend on retrieved snippets, not runtime execution
 - multi-file tracing is still based on static relationships
 - answer quality depends on the local Ollama model in use
+- suggested prompts are still repo-shaped heuristics, so they should be kept aligned with the repository you most often inspect
 - Streamlit state can be lost after reload in some cases
 
 ## Future improvements
@@ -336,29 +342,6 @@ Run tests with:
 - better filtering by directory and file type
 - more stable workspace persistence in the UI
 - broader retrieval and answer-formatting tests
-
-## GitHub description
-
-Suggested short GitHub description:
-
-```text
-Local-first codebase analysis assistant with source-grounded Q&A, cross-file tracing, artifact-flow explanation, and evidence-backed confidence signals.
-```
-
-Suggested GitHub topics:
-
-```text
-python
-streamlit
-rag
-ollama
-langchain
-llamaindex
-code-search
-developer-tools
-repository-analysis
-question-answering
-```
 
 ## License
 
