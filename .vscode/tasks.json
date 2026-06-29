@@ -27,7 +27,9 @@
         "-m",
         "streamlit",
         "run",
-        "app/ui.py"
+        "app/ui.py",
+        "--server.port",
+        "8502"
       ],
       "options": {
         "cwd": "${workspaceFolder}"

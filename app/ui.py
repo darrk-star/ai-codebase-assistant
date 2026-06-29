@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
+import re
 import sys
 
 import streamlit as st
@@ -29,11 +30,63 @@ SUGGESTED_QUESTIONS = (
     "What design risks do you see in this project?",
 )
 
+APP_BUILD_TAG = "relationship-filter-v5"
+
+STOP_BUTTON_CSS = """
+<style>
+.st-key-stop_question {
+    display: flex;
+    justify-content: flex-end;
+}
+.st-key-stop_question button {
+    width: 3rem !important;
+    height: 3rem !important;
+    min-width: 3rem !important;
+    max-width: 3rem !important;
+    min-height: 3rem !important;
+    max-height: 3rem !important;
+    aspect-ratio: 1 / 1 !important;
+    border-radius: 50% !important;
+    padding: 0 !important;
+    border: 1px solid rgba(255, 255, 255, 0.22) !important;
+    background: rgba(255, 255, 255, 0.05) !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    overflow: hidden !important;
+    position: relative !important;
+    font-size: 0.88rem !important;
+    font-weight: 700 !important;
+    line-height: 1 !important;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04) inset !important;
+}
+.st-key-stop_question button::after {
+    content: "";
+    width: 0.72rem;
+    height: 0.72rem;
+    border-radius: 0.08rem;
+    background: currentColor;
+    display: block;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+}
+.st-key-stop_question button p {
+    display: none !important;
+    margin: 0 !important;
+    line-height: 1 !important;
+}
+</style>
+"""
+
 
 def main() -> None:
     st.set_page_config(page_title="AI Codebase Assistant", page_icon=":books:", layout="wide")
+    st.markdown(STOP_BUTTON_CSS, unsafe_allow_html=True)
     st.title("AI Codebase Assistant")
     st.caption("Ask natural language questions about a local repository with LangChain, LlamaIndex, and Ollama.")
+    st.caption(f"Build: {APP_BUILD_TAG}")
 
     config = AppConfig.from_env()
     _init_session_state()
@@ -47,7 +100,7 @@ def main() -> None:
 
     with top_left:
         workspace_options = st.session_state["workspace_order"] or [active_repo]
-        selected_workspace = st.selectbox(
+        st.selectbox(
             "Saved workspaces",
             options=workspace_options,
             index=workspace_options.index(active_repo) if active_repo in workspace_options else 0,
@@ -107,24 +160,20 @@ def main() -> None:
         st.caption(f"Messages in this workspace: {len(current_workspace['messages'])}")
 
     workspace = _get_workspace(repo_path)
+    question_busy = _question_busy_for_repo(repo_path)
 
     st.markdown("### Suggested questions")
     q_col1, q_col2 = st.columns(2, gap="large")
-    for idx, question in enumerate(SUGGESTED_QUESTIONS):
+    for idx, prompt in enumerate(SUGGESTED_QUESTIONS):
         target_column = q_col1 if idx % 2 == 0 else q_col2
         with target_column:
             if st.button(
-                question,
+                prompt,
                 use_container_width=True,
                 key=f"suggest_q_{idx}",
-                disabled=workspace["index"] is None,
+                disabled=workspace["index"] is None or question_busy,
             ):
-                _submit_suggested_question(
-                    question,
-                    workspace,
-                    repo_path,
-                    config,
-                )
+                _queue_question(prompt, repo_path)
 
     st.markdown("### Conversation")
 
@@ -132,19 +181,46 @@ def main() -> None:
         st.info("Build or load an index first. Once the index is ready, suggested questions and chat input will become available.")
         return
 
-    st.caption("Questions run synchronously in the current page session. For config or model changes, stop and restart Streamlit.")
+    status_col, stop_col = st.columns([6, 1], gap="small")
+    with status_col:
+        if question_busy:
+            st.caption("Thinking... recommended questions are temporarily locked for this workspace.")
+        else:
+            st.caption("Questions run synchronously in the current page session. For config or model changes, stop and restart Streamlit.")
+    with stop_col:
+        pass
 
     _render_messages(workspace["messages"])
-    question = st.chat_input("Ask a question about the repository")
+    question = st.chat_input(
+        "Ask a question about the repository",
+        disabled=question_busy,
+    )
+
+    if question_busy:
+        st.markdown("<div style='height: 1.2rem;'></div>", unsafe_allow_html=True)
+        thinking_col, stop_col = st.columns([7, 1], gap="small", vertical_alignment="center")
+        with thinking_col:
+            thinking_placeholder = st.empty()
+        with stop_col:
+            if st.button(" ", key="stop_question", help="Stop the current question", use_container_width=True):
+                _cancel_pending_question(repo_path)
+    else:
+        thinking_placeholder = None
 
     if question:
-        _submit_suggested_question(question, workspace, repo_path, config)
+        _queue_question(question, repo_path)
+
+    _process_pending_question(workspace, repo_path, config, thinking_placeholder)
 
 
 def _init_session_state() -> None:
     st.session_state.setdefault("workspaces", {})
     st.session_state.setdefault("workspace_order", [])
     st.session_state.setdefault("active_repo_key", "")
+    st.session_state.setdefault("pending_question", "")
+    st.session_state.setdefault("pending_repo_key", "")
+    st.session_state.setdefault("question_in_flight", False)
+    st.session_state.setdefault("active_question_run_id", 0)
     if "repo_input_value" not in st.session_state:
         default_repo = str((Path(__file__).resolve().parents[2] / "github-efficiency-analyzer").resolve())
         st.session_state["repo_input_value"] = st.session_state["active_repo_key"] or default_repo
@@ -157,7 +233,7 @@ def _render_messages(messages: list[dict[str, object]]) -> None:
 
     for message in messages:
         with st.chat_message(message["role"]):
-            st.write(message["content"])
+            _render_message_content(str(message["content"]), str(message["role"]))
             search_question = message.get("search_question", "").strip()
             evidence = message.get("evidence") or []
             call_chain_summary = message.get("call_chain_summary", "").strip()
@@ -199,6 +275,16 @@ def _render_messages(messages: list[dict[str, object]]) -> None:
                         st.code(source)
 
 
+def _render_message_content(content: str, role: str) -> None:
+    if role != "assistant":
+        st.write(content)
+        return
+
+    body = re.split(r"\n\s*Sources:\s*\n", content, maxsplit=1)[0].strip()
+    body = body.replace("\nWhy:\n", "\n\nWhy:\n\n")
+    st.markdown(body)
+
+
 def _get_active_repo(default_repo: str) -> str:
     active_repo_key = st.session_state.get("active_repo_key", "")
     if active_repo_key:
@@ -235,11 +321,72 @@ def _save_workspace(repo_path: Path, index: object) -> None:
     st.session_state["active_repo_key"] = _repo_key(repo_path)
 
 
+def _question_busy_for_repo(repo_path: Path) -> bool:
+    return bool(st.session_state.get("question_in_flight")) and st.session_state.get("pending_repo_key", "") == _repo_key(repo_path)
+
+
+def _queue_question(question: str, repo_path: Path) -> None:
+    cleaned_question = question.strip()
+    if not cleaned_question or _question_busy_for_repo(repo_path):
+        return
+
+    workspace = _get_workspace(repo_path)
+    workspace["messages"].append(
+        {
+            "role": "user",
+            "content": cleaned_question,
+        }
+    )
+    st.session_state["workspaces"][_repo_key(repo_path)] = workspace
+    st.session_state["pending_question"] = cleaned_question
+    st.session_state["pending_repo_key"] = _repo_key(repo_path)
+    st.session_state["question_in_flight"] = True
+    st.session_state["active_question_run_id"] = st.session_state.get("active_question_run_id", 0) + 1
+    st.rerun()
+
+
+def _cancel_pending_question(repo_path: Path) -> None:
+    if not _question_busy_for_repo(repo_path):
+        return
+
+    st.session_state["pending_question"] = ""
+    st.session_state["pending_repo_key"] = ""
+    st.session_state["question_in_flight"] = False
+    st.session_state["active_question_run_id"] = st.session_state.get("active_question_run_id", 0) + 1
+    st.rerun()
+
+
+def _process_pending_question(
+    workspace: dict[str, object],
+    repo_path: Path,
+    config: AppConfig,
+    thinking_placeholder: object | None = None,
+) -> None:
+    pending_question = st.session_state.get("pending_question", "").strip()
+    pending_repo_key = st.session_state.get("pending_repo_key", "")
+
+    if not pending_question or pending_repo_key != _repo_key(repo_path):
+        return
+    if not st.session_state.get("question_in_flight"):
+        return
+
+    run_id = st.session_state.get("active_question_run_id", 0)
+    try:
+        _submit_suggested_question(pending_question, workspace, repo_path, config, run_id, thinking_placeholder)
+    finally:
+        if st.session_state.get("active_question_run_id", 0) == run_id:
+            st.session_state["pending_question"] = ""
+            st.session_state["pending_repo_key"] = ""
+            st.session_state["question_in_flight"] = False
+
+
 def _submit_suggested_question(
     question: str,
     workspace: dict[str, object],
     repo_path: Path,
     config: AppConfig,
+    run_id: int | None = None,
+    thinking_placeholder: object | None = None,
 ) -> None:
     if workspace["index"] is None:
         workspace["messages"].append(
@@ -260,13 +407,8 @@ def _submit_suggested_question(
         st.rerun()
         return
 
-    workspace["messages"].append(
-        {
-            "role": "user",
-            "content": question,
-        }
-    )
-    with st.spinner("Thinking..."):
+    spinner_host = thinking_placeholder if thinking_placeholder is not None else st
+    with spinner_host.spinner("Thinking..."):
         try:
             result = answer_question(
                 index=workspace["index"],
@@ -275,6 +417,8 @@ def _submit_suggested_question(
                 repo_path=repo_path,
                 history=workspace["messages"],
             )
+            if _question_run_canceled(repo_path, run_id):
+                return
             workspace["messages"].append(
                 {
                     "role": "assistant",
@@ -289,6 +433,8 @@ def _submit_suggested_question(
                 }
             )
         except Exception as exc:  # noqa: BLE001
+            if _question_run_canceled(repo_path, run_id):
+                return
             workspace["messages"].append(
                 {
                     "role": "assistant",
@@ -305,6 +451,16 @@ def _submit_suggested_question(
     st.session_state["workspaces"][_repo_key(repo_path)] = workspace
     st.session_state["active_repo_key"] = _repo_key(repo_path)
     st.rerun()
+
+
+def _question_run_canceled(repo_path: Path, run_id: int | None) -> bool:
+    if run_id is None:
+        return False
+    return (
+        st.session_state.get("active_question_run_id", 0) != run_id
+        or st.session_state.get("pending_repo_key", "") != _repo_key(repo_path)
+        or not st.session_state.get("question_in_flight", False)
+    )
 
 
 def _handle_workspace_change() -> None:

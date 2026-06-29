@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -312,20 +312,51 @@ def _build_typed_answer(
 ) -> str:
     question_type = _classify_question_type(question, call_chain_summary)
     if question_type == "artifact_flow":
-        return ""
-
-    if question_type == "relationship_trace" and call_chain_summary:
-        chain_lines = [line.strip() for line in call_chain_summary.splitlines() if line.strip()]
-        if not chain_lines:
+        if call_chain_summary:
             return ""
-        why_lines = _compress_chain_lines(chain_lines[:3])
+        answer_line = "Answer: The retrieved implementation points to a repository flow for this artifact, but the full cross-file chain was not recovered exactly."
+        why_lines = _build_flow_evidence_why_lines(evidence_blocks)
+        if not why_lines:
+            why_lines = [
+                "- The retrieved files are implementation files, but they do not expose a complete writer chain for this artifact.",
+            ]
         return _format_typed_answer(
-            answer_line="Answer: This behavior is implemented through a cross-file relationship rather than a single isolated file.",
+            answer_line=answer_line,
             why_lines=why_lines,
             source_paths=source_paths,
         )
 
+    if question_type == "relationship_trace":
+        if call_chain_summary:
+            chain_lines = [line.strip() for line in call_chain_summary.splitlines() if line.strip()]
+            if not chain_lines:
+                return ""
+            why_lines = _compress_chain_lines(chain_lines[:3])
+            relationship_sources = source_paths
+        else:
+            relationship_evidence = _prioritize_relationship_evidence(evidence_blocks, question)
+            why_lines = _build_relationship_evidence_why_lines(relationship_evidence)
+            relationship_sources = [
+                str(item.get("file_path", ""))
+                for item in relationship_evidence
+                if str(item.get("file_path", "")).strip() and str(item.get("file_path", "")) != "call-chain-summary"
+            ]
+            if not why_lines:
+                identifiers = ", ".join(f"`{term}`" for term in _extract_identifier_terms(question))
+                target = identifiers or "the requested identifier"
+                why_lines = [
+                    f"- I could not find precise implementation evidence for {target} in the retrieved repository context.",
+                ]
+        return _format_typed_answer(
+            answer_line="Answer: This behavior is implemented through a cross-file relationship rather than a single isolated file.",
+            why_lines=why_lines,
+            source_paths=list(dict.fromkeys(relationship_sources)),
+        )
+
     if question_type == "entity_location":
+        composite_answer = _build_composite_entity_location_answer(source_paths, evidence_blocks, question)
+        if composite_answer:
+            return composite_answer
         location = source_paths[0] if source_paths else "the retrieved repository context"
         why_lines = _build_evidence_why_lines(evidence_blocks)
         if not why_lines:
@@ -340,9 +371,8 @@ def _build_typed_answer(
         cleaned = answer_text.strip()
         if not cleaned:
             return ""
-        cleaned = _soften_open_analysis_answer(cleaned)
-        answer_line = _extract_answer_line(cleaned)
         why_lines = _build_open_analysis_why_lines(evidence_blocks)
+        answer_line = _build_open_analysis_answer_line(why_lines)
         if not why_lines:
             why_lines = [
                 "- This is a repository-grounded summary based on the most relevant retrieved files, not a runtime proof."
@@ -359,6 +389,8 @@ def _build_typed_answer(
 def _classify_question_type(question: str, call_chain_summary: str) -> str:
     question_lower = question.lower()
     if _is_flow_question(question_lower) and call_chain_summary:
+        return "artifact_flow"
+    if _is_flow_question(question_lower):
         return "artifact_flow"
     if any(
         token in question_lower
@@ -390,6 +422,34 @@ def _build_evidence_why_lines(evidence_blocks: list[dict[str, str]], limit: int 
     return why_lines
 
 
+def _build_flow_evidence_why_lines(
+    evidence_blocks: list[dict[str, str]],
+    limit: int = 3,
+) -> list[str]:
+    why_lines: list[str] = []
+    for item in evidence_blocks[:limit]:
+        file_path = str(item.get("file_path", "")).strip()
+        if not file_path or file_path == "call-chain-summary":
+            continue
+        snippet = str(item.get("snippet", "")).strip()
+        why_lines.append(_describe_flow_evidence(file_path, snippet))
+    return why_lines
+
+
+def _build_relationship_evidence_why_lines(
+    evidence_blocks: list[dict[str, str]],
+    limit: int = 3,
+) -> list[str]:
+    why_lines: list[str] = []
+    for item in evidence_blocks[:limit]:
+        file_path = str(item.get("file_path", "")).strip()
+        if not file_path or file_path == "call-chain-summary":
+            continue
+        snippet = str(item.get("snippet", "")).strip()
+        why_lines.append(_describe_relationship_evidence(file_path, snippet))
+    return why_lines
+
+
 def _build_open_analysis_why_lines(
     evidence_blocks: list[dict[str, str]],
     limit: int = 3,
@@ -402,6 +462,62 @@ def _build_open_analysis_why_lines(
         snippet = str(item.get("snippet", "")).strip()
         why_lines.append(_describe_open_analysis_evidence(file_path, snippet))
     return why_lines
+
+
+def _describe_relationship_evidence(file_path: str, snippet: str) -> str:
+    condensed = " ".join(snippet.split())
+
+    function_match = re.search(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet)
+    call_targets = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\(", snippet)
+    defined_name = function_match.group(1) if function_match else ""
+    meaningful_calls = [name for name in call_targets if name not in LOW_SIGNAL_FUNCTIONS and name != defined_name]
+
+    if function_match and meaningful_calls:
+        function_name = function_match.group(1)
+        target_name = meaningful_calls[0]
+        return f"- `{file_path}` defines `{function_name}()` and contains a call to `{target_name}()`, which is direct implementation evidence for the cross-file relationship."
+    if function_match:
+        function_name = function_match.group(1)
+        return f"- `{file_path}` defines `{function_name}()`, which is one of the implementation points retrieved for this cross-file relationship."
+    if meaningful_calls:
+        target_name = meaningful_calls[0]
+        return f"- `{file_path}` contains a call to `{target_name}()`, which suggests this file participates in the cross-file behavior."
+    if condensed:
+        preview = condensed[:120].rstrip()
+        if len(condensed) > 120:
+            preview += "..."
+        return f"- `{file_path}` includes implementation detail such as `{preview}`, which is more concrete than a generic summary for this relationship."
+    return f"- `{file_path}` is one of the implementation files retrieved for this cross-file relationship."
+
+
+def _describe_flow_evidence(file_path: str, snippet: str) -> str:
+    condensed = " ".join(snippet.split())
+
+    writer_match = re.search(r"writes?\s+`?([A-Za-z0-9_./-]+)`?", snippet)
+    output_path_match = re.search(r"output_path\s*=\s*['\"]([^'\"]+)['\"]", snippet)
+    function_match = re.search(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet)
+    call_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\(", snippet)
+
+    if writer_match:
+        output_path = writer_match.group(1)
+        normalized_output = output_path if "/" in output_path else f"outputs/{output_path}"
+        return f"- `{file_path}` contains the write step for `{normalized_output}`, so it is part of the artifact generation path."
+    if output_path_match:
+        output_path = output_path_match.group(1)
+        normalized_output = output_path if "/" in output_path else f"outputs/{output_path}"
+        return f"- `{file_path}` contains the write step for `{normalized_output}`, so it is part of the artifact generation path."
+    if function_match:
+        function_name = function_match.group(1)
+        return f"- `{file_path}` defines `{function_name}()`, which is one of the implementation entry points retrieved for this artifact flow."
+    if call_match and any(token in snippet for token in ("build_", "write_", "compute_", "generate_")):
+        function_name = call_match.group(1)
+        return f"- `{file_path}` contains implementation calls such as `{function_name}()`, which indicates this file participates in the build path."
+    if condensed:
+        preview = condensed[:120].rstrip()
+        if len(condensed) > 120:
+            preview += "..."
+        return f"- `{file_path}` includes implementation detail such as `{preview}`, which is more concrete than a README-level summary for this flow."
+    return f"- `{file_path}` is one of the implementation files retrieved for this artifact flow."
 
 
 def _describe_open_analysis_evidence(file_path: str, snippet: str) -> str:
@@ -444,21 +560,160 @@ def _soften_open_analysis_answer(answer_text: str) -> str:
     return f"Based on the retrieved implementation, {cleaned[:1].lower()}{cleaned[1:]}"
 
 
+def _build_open_analysis_answer_line(why_lines: list[str]) -> str:
+    if not why_lines:
+        return "Answer: Based on the retrieved implementation, the current code suggests a few design risks worth reviewing."
+
+    risk_phrases: list[str] = []
+    for line in why_lines:
+        text = line.lstrip("- ").strip().rstrip(".")
+        if "hard-codes failure classification rules" in text:
+            risk_phrases.append("hard-coded failure classification rules")
+        elif "falls back to a generic `unknown_failure` path" in text:
+            risk_phrases.append("coarse unknown-failure fallback behavior")
+        elif "aggregates workflow signals through in-memory counters" in text:
+            risk_phrases.append("concentrated in-memory aggregation logic")
+        elif "defines `" in text and "implementation points" in text:
+            risk_phrases.append("single-function coupling around core analysis paths")
+
+    unique_phrases = list(dict.fromkeys(risk_phrases))
+    if unique_phrases:
+        top = ", ".join(unique_phrases[:2])
+        return f"Answer: Based on the retrieved implementation, the main design risks are {top}."
+
+    return "Answer: Based on the retrieved implementation, the current code suggests a few design risks worth reviewing."
+
+
 def _extract_answer_line(answer_text: str) -> str:
     cleaned = answer_text.strip()
     if not cleaned:
         return "Answer: Based on the retrieved implementation, the current code suggests a few design risks worth reviewing."
     first_line = cleaned.splitlines()[0].strip()
+    first_line = _strip_trailing_why_marker(first_line)
     if first_line.lower().startswith("answer:"):
         return first_line
     return f"Answer: {first_line}"
 
 
 def _format_typed_answer(answer_line: str, why_lines: list[str], source_paths: list[str]) -> str:
+    answer_line = _strip_trailing_why_marker(answer_line)
     source_section = ""
     if source_paths:
         source_section = "\n\nSources:\n" + "\n".join(f"- {path}" for path in source_paths[:5])
     return f"{answer_line}\nWhy:\n" + "\n".join(why_lines) + source_section
+
+
+def _strip_trailing_why_marker(line: str) -> str:
+    cleaned = line.strip()
+    if not cleaned:
+        return cleaned
+
+    marker_pattern = r"(?:\s*[\*\_`#>\-]*)\bwhy\b(?:\s*[:：\.])\s*$"
+    had_marker = bool(re.search(marker_pattern, cleaned, flags=re.IGNORECASE))
+    if not had_marker:
+        return cleaned
+
+    cleaned = re.sub(
+        marker_pattern,
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).rstrip()
+    cleaned = cleaned.rstrip(":：.").rstrip()
+    if cleaned and cleaned[-1].isalnum():
+        cleaned = f"{cleaned}."
+    return cleaned
+
+
+def _build_composite_entity_location_answer(
+    source_paths: list[str],
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+) -> str:
+    if not _is_fetch_summary_location_query(question):
+        return ""
+
+    evidence_by_path = {
+        str(item.get("file_path", "")).replace("\\", "/"): item
+        for item in evidence_blocks
+        if str(item.get("file_path", "")).strip()
+    }
+    normalized_sources = [path.replace("\\", "/") for path in source_paths]
+
+    fetch_path = next((path for path in normalized_sources if path.endswith("github_client.py")), "")
+    summary_metric_path = next((path for path in normalized_sources if path.endswith("metrics.py")), "")
+    summary_report_path = next((path for path in normalized_sources if path.endswith("report.py")), "")
+    main_path = next((path for path in normalized_sources if path.endswith("main.py")), "")
+
+    if not fetch_path:
+        fetch_path = next(
+            (
+                path
+                for path, item in evidence_by_path.items()
+                if "fetch_workflow_runs" in str(item.get("snippet", "")).lower()
+                or path.endswith("github_client.py")
+            ),
+            "",
+        )
+    if not summary_metric_path:
+        summary_metric_path = next(
+            (
+                path
+                for path, item in evidence_by_path.items()
+                if "summarize_workflow_runs" in str(item.get("snippet", "")).lower()
+            ),
+            "",
+        )
+    if not summary_report_path:
+        summary_report_path = next(
+            (
+                path
+                for path, item in evidence_by_path.items()
+                if path.endswith("report.py")
+                and "write_markdown_report" in str(item.get("snippet", "")).lower()
+            ),
+            "",
+        )
+    if not summary_report_path:
+        main_snippet = str(evidence_by_path.get(main_path, {}).get("snippet", "")).lower() if main_path else ""
+        if "write_markdown_report" in main_snippet and "workflow_summary" in main_snippet:
+            summary_report_path = "app/report.py"
+
+    if not fetch_path or not (summary_metric_path or summary_report_path or main_path):
+        return ""
+
+    if summary_metric_path and summary_report_path:
+        answer_line = (
+            f"Answer: GitHub workflow runs are fetched in `{fetch_path}`, then summarized in "
+            f"`{summary_metric_path}` and written into the report flow in `{summary_report_path}`."
+        )
+    elif summary_metric_path:
+        answer_line = (
+            f"Answer: GitHub workflow runs are fetched in `{fetch_path}` and summarized in `{summary_metric_path}`."
+        )
+    elif summary_report_path:
+        answer_line = (
+            f"Answer: GitHub workflow runs are fetched in `{fetch_path}` and then written into the summary report flow in `{summary_report_path}`."
+        )
+    else:
+        answer_line = (
+            f"Answer: GitHub workflow runs are fetched in `{fetch_path}` and passed through the summary flow rooted in `{main_path}`."
+        )
+
+    why_lines: list[str] = [f"- `{fetch_path}` contains the workflow-run fetching implementation."]
+    if main_path:
+        why_lines.append(f"- `{main_path}` calls the workflow-fetching logic and wires the results into downstream summary generation.")
+    if summary_metric_path:
+        why_lines.append(f"- `{summary_metric_path}` contains `summarize_workflow_runs()`, which aggregates the fetched workflow-run data.")
+    if summary_report_path:
+        why_lines.append(f"- `{summary_report_path}` contains the report-writing step that consumes the summarized workflow data.")
+
+    composite_sources = [path for path in [fetch_path, main_path, summary_metric_path, summary_report_path] if path]
+    return _format_typed_answer(
+        answer_line=answer_line,
+        why_lines=why_lines[:4],
+        source_paths=list(dict.fromkeys(composite_sources)),
+    )
 
 
 def _build_chain_first_answer(
@@ -480,7 +735,7 @@ def _build_chain_first_answer(
     if any(token in question_lower for token in ("weekly digest", "weekly_digest.md", "summary.md")):
         answer_line = "Answer: This artifact is built through a multi-step repository flow that starts in the CLI entrypoint, then calls builder functions, and finally writes the output file."
 
-    why_lines = _compress_chain_lines(chain_lines[:3])
+    why_lines = _describe_chain_lines(_compress_chain_lines(chain_lines[:3]))
     source_section = ""
     if source_paths:
         source_section = "\n\nSources:\n" + "\n".join(f"- {path}" for path in source_paths[:5])
@@ -529,6 +784,28 @@ def _compress_chain_lines(chain_lines: list[str]) -> list[str]:
     return deduped
 
 
+def _describe_chain_lines(chain_lines: list[str]) -> list[str]:
+    described: list[str] = []
+    for line in chain_lines:
+        clean = line.lstrip("- ").strip()
+        call_match = re.match(r"`([^`]+)` -> `([^`]+)\(\)` -> `([^`]+)`", clean)
+        if call_match:
+            caller_path, function_name, callee_path = call_match.groups()
+            described.append(
+                f"- `{caller_path}` calls `{function_name}()`, whose implementation is in `{callee_path}`."
+            )
+            continue
+
+        writer_match = re.match(r"`([^`]+)` -> writes `([^`]+)`", clean)
+        if writer_match:
+            writer_path, output_path = writer_match.groups()
+            described.append(f"- `{writer_path}` writes the generated artifact to `{output_path}`.")
+            continue
+
+        described.append(f"- {clean}")
+    return described
+
+
 def _format_history(history: list[dict[str, str]], max_turns: int = 6) -> str:
     if not history:
         return "No prior conversation."
@@ -553,6 +830,20 @@ def _filter_sources_for_question(
     deduped = list(dict.fromkeys(source_paths))
     question_lower = question.lower()
     question_type = _classify_question_type(question, call_chain_summary)
+    if question_type == "relationship_trace" and not call_chain_summary:
+        identifiers = _extract_identifier_terms(question)
+        if identifiers:
+            exact_paths = [
+                path
+                for path in deduped
+                if not path.replace("\\", "/").lower().endswith("readme.md")
+                and any(identifier in path.replace("\\", "/").lower() for identifier in identifiers)
+            ]
+            if exact_paths:
+                return exact_paths[:5]
+    if question_type == "entity_location":
+        return _prioritize_entity_location_paths(deduped, question)
+
     if not _is_flow_question(question) and not call_chain_summary:
         if question_type != "open_analysis":
             return deduped
@@ -574,9 +865,8 @@ def _filter_sources_for_question(
                 continue
             filtered.append(path)
             continue
-        if chain_lower and normalized not in chain_lower and not normalized.startswith("outputs/"):
-            if not normalized.endswith((".py", ".md")):
-                continue
+        if chain_lower and normalized not in chain_lower:
+            continue
         filtered.append(path)
 
     if question_type == "open_analysis" and not _is_flow_question(question_lower):
@@ -593,6 +883,11 @@ def _filter_evidence_for_question(
     question_lower = question.lower()
     question_type = _classify_question_type(question, "")
     is_flow = _is_flow_question(question_lower)
+    if question_type == "relationship_trace":
+        return _prioritize_relationship_evidence(evidence_blocks, question)
+    if question_type == "entity_location":
+        return _prioritize_entity_location_evidence(evidence_blocks, question)
+
     if not is_flow and question_type != "open_analysis":
         return evidence_blocks
 
@@ -625,6 +920,194 @@ def _filter_evidence_for_question(
         return ranked or evidence_blocks
 
     return filtered or evidence_blocks
+
+
+def _prioritize_entity_location_paths(paths: list[str], question: str, limit: int = 2) -> list[str]:
+    if _is_fetch_summary_location_query(question):
+        return _prioritize_fetch_summary_paths(paths) or list(dict.fromkeys(paths))[:4]
+
+    unique_paths = list(dict.fromkeys(paths))
+    ranked = sorted(
+        unique_paths,
+        key=lambda path: (_entity_location_path_score(path, question), path.replace("\\", "/").lower()),
+        reverse=True,
+    )
+    filtered = [
+        path
+        for path in ranked
+        if _entity_location_path_score(path, question) > 0
+        and not path.replace("\\", "/").lower().endswith("readme.md")
+        and not path.replace("\\", "/").lower().startswith(("tests/", "outputs/"))
+    ]
+    question_lower = question.lower()
+    entrypoint_query = any(token in question_lower for token in ("argparse", "main function", "entrypoint", "cli", "command"))
+    if entrypoint_query:
+        strong_main = [path for path in filtered if path.replace("\\", "/").lower().endswith("main.py")]
+        if strong_main:
+            return strong_main[:1]
+    return filtered[:limit] or list(dict.fromkeys(paths))[:limit]
+
+
+def _prioritize_entity_location_evidence(
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+    limit: int = 2,
+) -> list[dict[str, str]]:
+    if _is_fetch_summary_location_query(question):
+        return _prioritize_fetch_summary_evidence(evidence_blocks) or evidence_blocks[:4]
+
+    ranked = sorted(
+        enumerate(evidence_blocks),
+        key=lambda entry: (
+            _entity_location_evidence_score(entry[1], question),
+            -entry[0],
+        ),
+        reverse=True,
+    )
+    filtered = [
+        item
+        for _, item in ranked
+        if _entity_location_evidence_score(item, question) > 0
+        and not str(item.get("file_path", "")).replace("\\", "/").lower().endswith("readme.md")
+        and not str(item.get("file_path", "")).replace("\\", "/").lower().startswith(("tests/", "outputs/"))
+    ]
+    question_lower = question.lower()
+    entrypoint_query = any(token in question_lower for token in ("argparse", "main function", "entrypoint", "cli", "command"))
+    if entrypoint_query:
+        strong_main = [
+            item
+            for item in filtered
+            if str(item.get("file_path", "")).replace("\\", "/").lower().endswith("main.py")
+        ]
+        if strong_main:
+            return strong_main[:1]
+    return filtered[:limit] or evidence_blocks[:limit]
+
+
+def _is_fetch_summary_location_query(question: str) -> bool:
+    question_lower = question.lower()
+    return "fetch" in question_lower and "summarized" in question_lower
+
+
+def _prioritize_fetch_summary_paths(paths: list[str]) -> list[str]:
+    normalized_paths = list(dict.fromkeys(path.replace("\\", "/") for path in paths))
+    preferred_suffixes = (
+        "main.py",
+        "report.py",
+        "metrics.py",
+        "github_client.py",
+    )
+    prioritized: list[str] = []
+    for suffix in preferred_suffixes:
+        for path in normalized_paths:
+            if path.endswith(suffix) and path not in prioritized:
+                prioritized.append(path)
+    return prioritized
+
+
+def _prioritize_fetch_summary_evidence(
+    evidence_blocks: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    preferred_suffixes = (
+        "main.py",
+        "report.py",
+        "metrics.py",
+        "github_client.py",
+    )
+    prioritized: list[dict[str, str]] = []
+    for suffix in preferred_suffixes:
+        for item in evidence_blocks:
+            file_path = str(item.get("file_path", "")).replace("\\", "/")
+            if file_path.endswith(suffix) and item not in prioritized:
+                prioritized.append(item)
+                break
+    return prioritized
+
+
+def _entity_location_path_score(path: str, question: str) -> int:
+    normalized = path.replace("\\", "/").lower()
+    question_lower = question.lower()
+    config_query = any(token in question_lower for token in ("setting", "configured", "config", "environment", "base url"))
+    entrypoint_query = any(token in question_lower for token in ("argparse", "main function", "entrypoint", "cli", "command"))
+    score = 0
+    if normalized.endswith(".py"):
+        score += 1
+    if config_query and "config" in normalized:
+        score += 8
+    if entrypoint_query and "main.py" in normalized:
+        score += 10
+    elif "main.py" in normalized:
+        score += 4
+    if config_query:
+        if any(token in normalized for token in ("config", "settings", "env", "main.py")):
+            score += 4
+    for term in _extract_identifier_terms(question):
+        if term in normalized:
+            score += 4
+    return score
+
+
+def _entity_location_evidence_score(item: dict[str, str], question: str) -> int:
+    file_path = str(item.get("file_path", "")).replace("\\", "/").lower()
+    snippet = str(item.get("snippet", "")).lower()
+    question_lower = question.lower()
+    score = _entity_location_path_score(file_path, question)
+    entrypoint_query = any(token in question_lower for token in ("argparse", "main function", "entrypoint", "cli", "command"))
+    if "ollama" in question_lower:
+        if "ollama" in snippet:
+            score += 8
+        if "base_url" in snippet or "base url" in snippet:
+            score += 6
+    if entrypoint_query:
+        if "argparse" in snippet or "argumentparser" in snippet:
+            score += 10
+        if "def main" in snippet or "__main__" in snippet:
+            score += 8
+    if any(token in snippet for token in ("os.getenv", "from_env", "load_dotenv", "env")):
+        score += 4
+    for term in _extract_identifier_terms(question):
+        if term in snippet:
+            score += 5
+    return score
+
+
+def _prioritize_relationship_evidence(
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+) -> list[dict[str, str]]:
+    identifiers = _extract_identifier_terms(question)
+    if not identifiers:
+        return evidence_blocks
+
+    ranked: list[tuple[int, int, dict[str, str]]] = []
+    for index, item in enumerate(evidence_blocks):
+        file_path = str(item.get("file_path", "")).replace("\\", "/").lower()
+        snippet = str(item.get("snippet", "")).lower()
+        if file_path.endswith("readme.md"):
+            continue
+        if file_path.startswith("tests/") or "/tests/" in file_path:
+            continue
+        if file_path.startswith("outputs/") or "/outputs/" in file_path:
+            continue
+
+        score = 0
+        for identifier in identifiers:
+            if f"def {identifier}" in snippet or f"class {identifier}" in snippet:
+                score += 8
+            if f"{identifier}(" in snippet:
+                score += 6
+            if identifier in snippet:
+                score += 3
+            if identifier in file_path:
+                score += 2
+        if score > 0:
+            ranked.append((-score, index, item))
+
+    if not ranked:
+        return []
+
+    ranked.sort(key=lambda entry: (entry[0], entry[1]))
+    return [item for _, _, item in ranked[:4]]
 
 
 def _prioritize_open_analysis_paths(paths: list[str]) -> list[str]:
