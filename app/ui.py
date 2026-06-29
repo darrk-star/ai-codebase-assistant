@@ -24,7 +24,7 @@ SUGGESTED_QUESTIONS = (
     "How is the summary report built?",
     "Where is the Ollama base URL configured?",
     "Which file contains argparse and the main function?",
-    "What calls compute_digest across files?",
+    "What calls summarize_workflow_runs across files?",
     "Which file fetches GitHub workflow runs and where are they summarized?",
     "Where are CI charts generated?",
     "What design risks do you see in this project?",

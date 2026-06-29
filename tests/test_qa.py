@@ -252,7 +252,7 @@ def test_finalize_answer_formats_relationship_trace_question() -> None:
         call_chain_summary="- `app/service.py` -> `compute_digest()` -> `app/helpers.py`",
     )
 
-    assert "cross-file relationship" in result
+    assert "Answer: `compute_digest()` is called from `app/service.py` and defined in `app/helpers.py`." in result
     assert "`app/service.py` -> `compute_digest()` -> `app/helpers.py`" in result
 
 
@@ -281,7 +281,7 @@ def test_finalize_answer_rebuilds_relationship_why_without_generic_model_text() 
     )
 
     assert "compute_digest is called in write_weekly_digest_report" not in result
-    assert "cross-file relationship" in result
+    assert "Answer: `compute_digest()` is called from `app/report.py` and defined in `app/metrics.py`." in result
     assert "defines `write_weekly_digest_report()` and contains a call to `compute_digest()`" in result
     assert "defines `compute_digest()`" in result
 
@@ -910,6 +910,29 @@ def test_build_open_analysis_why_lines_prefers_implementation_signals() -> None:
 
     assert "hard-codes failure classification rules" in why_lines[0]
     assert "aggregates workflow signals through in-memory counters" in why_lines[1]
+
+
+def test_build_relationship_evidence_why_lines_filters_unrelated_calls() -> None:
+    why_lines = qa._build_relationship_evidence_why_lines(
+        [
+            {
+                "file_path": "app/metrics.py",
+                "reason": "Vector retrieval result",
+                "snippet": "def summarize_workflow_runs(records):\n    return (record.conclusion or '').lower()",
+            },
+            {
+                "file_path": "app/main.py",
+                "reason": "Vector retrieval result",
+                "snippet": "logging.info('Fetching workflow runs');\nworkflow_summary = summarize_workflow_runs(workflow_records)",
+            },
+        ],
+        question="What calls summarize_workflow_runs across files?",
+    )
+
+    assert "lower()" not in why_lines[0]
+    assert "defines `summarize_workflow_runs()`" in why_lines[0]
+    assert "info()" not in why_lines[1]
+    assert "contains a call to `summarize_workflow_runs()`" in why_lines[1]
 
 
 def test_extract_best_snippet_prefers_open_analysis_aggregation_patterns() -> None:

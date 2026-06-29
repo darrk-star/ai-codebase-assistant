@@ -203,7 +203,7 @@ def test_suggested_questions_cover_multiple_question_types() -> None:
 
     assert "How is the weekly digest built?" in prompts
     assert "Where is the Ollama base URL configured?" in prompts
-    assert "What calls compute_digest across files?" in prompts
+    assert "What calls summarize_workflow_runs across files?" in prompts
     assert "What design risks do you see in this project?" in prompts
 
 

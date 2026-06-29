@@ -333,9 +333,14 @@ def _build_typed_answer(
                 return ""
             why_lines = _compress_chain_lines(chain_lines[:3])
             relationship_sources = source_paths
+            answer_line = _build_relationship_answer_line(
+                question=question,
+                call_chain_summary=call_chain_summary,
+                evidence_blocks=evidence_blocks,
+            )
         else:
             relationship_evidence = _prioritize_relationship_evidence(evidence_blocks, question)
-            why_lines = _build_relationship_evidence_why_lines(relationship_evidence)
+            why_lines = _build_relationship_evidence_why_lines(relationship_evidence, question)
             relationship_sources = [
                 str(item.get("file_path", ""))
                 for item in relationship_evidence
@@ -347,8 +352,13 @@ def _build_typed_answer(
                 why_lines = [
                     f"- I could not find precise implementation evidence for {target} in the retrieved repository context.",
                 ]
+            answer_line = _build_relationship_answer_line(
+                question=question,
+                call_chain_summary="",
+                evidence_blocks=relationship_evidence,
+            )
         return _format_typed_answer(
-            answer_line="Answer: This behavior is implemented through a cross-file relationship rather than a single isolated file.",
+            answer_line=answer_line,
             why_lines=why_lines,
             source_paths=list(dict.fromkeys(relationship_sources)),
         )
@@ -438,16 +448,60 @@ def _build_flow_evidence_why_lines(
 
 def _build_relationship_evidence_why_lines(
     evidence_blocks: list[dict[str, str]],
+    question: str = "",
     limit: int = 3,
 ) -> list[str]:
     why_lines: list[str] = []
+    identifiers = _extract_identifier_terms(question) if question else []
     for item in evidence_blocks[:limit]:
         file_path = str(item.get("file_path", "")).strip()
         if not file_path or file_path == "call-chain-summary":
             continue
         snippet = str(item.get("snippet", "")).strip()
-        why_lines.append(_describe_relationship_evidence(file_path, snippet))
+        why_lines.append(_describe_relationship_evidence(file_path, snippet, identifiers))
     return why_lines
+
+
+def _build_relationship_answer_line(
+    question: str,
+    call_chain_summary: str,
+    evidence_blocks: list[dict[str, str]],
+) -> str:
+    identifiers = _extract_identifier_terms(question)
+    if identifiers:
+        target = identifiers[0]
+        if call_chain_summary:
+            chain_match = re.search(
+                r"`([^`]+)` -> `(" + re.escape(target.lower()) + r")\(\)` -> `([^`]+)`",
+                call_chain_summary.lower(),
+            )
+            if chain_match:
+                caller_path, _, definition_path = chain_match.groups()
+                return (
+                    f"Answer: `{target}()` is called from `{caller_path}` and defined in `{definition_path}`."
+                )
+
+        definition_path = ""
+        caller_path = ""
+        target_lower = target.lower()
+        for item in evidence_blocks:
+            file_path = str(item.get("file_path", "")).strip()
+            snippet = str(item.get("snippet", "")).lower()
+            if not file_path or file_path == "call-chain-summary":
+                continue
+            if not definition_path and f"def {target_lower}" in snippet:
+                definition_path = file_path
+            if not caller_path and f"{target_lower}(" in snippet and f"def {target_lower}" not in snippet:
+                caller_path = file_path
+
+        if caller_path and definition_path:
+            return f"Answer: `{target}()` is called from `{caller_path}` and defined in `{definition_path}`."
+        if definition_path:
+            return f"Answer: `{target}()` is defined in `{definition_path}` and participates in a cross-file relationship."
+        if caller_path:
+            return f"Answer: `{target}()` is called from `{caller_path}` as part of a cross-file relationship."
+
+    return "Answer: This behavior is implemented through a cross-file relationship rather than a single isolated file."
 
 
 def _build_open_analysis_why_lines(
@@ -464,13 +518,24 @@ def _build_open_analysis_why_lines(
     return why_lines
 
 
-def _describe_relationship_evidence(file_path: str, snippet: str) -> str:
+def _describe_relationship_evidence(
+    file_path: str,
+    snippet: str,
+    identifiers: list[str] | None = None,
+) -> str:
     condensed = " ".join(snippet.split())
+    identifiers = [identifier.lower() for identifier in (identifiers or []) if identifier.strip()]
 
     function_match = re.search(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet)
     call_targets = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\(", snippet)
     defined_name = function_match.group(1) if function_match else ""
-    meaningful_calls = [name for name in call_targets if name not in LOW_SIGNAL_FUNCTIONS and name != defined_name]
+    meaningful_calls = [
+        name
+        for name in call_targets
+        if name not in LOW_SIGNAL_FUNCTIONS and name != defined_name
+    ]
+    if identifiers:
+        meaningful_calls = [name for name in meaningful_calls if name.lower() in identifiers]
 
     if function_match and meaningful_calls:
         function_name = function_match.group(1)
@@ -482,6 +547,9 @@ def _describe_relationship_evidence(file_path: str, snippet: str) -> str:
     if meaningful_calls:
         target_name = meaningful_calls[0]
         return f"- `{file_path}` contains a call to `{target_name}()`, which suggests this file participates in the cross-file behavior."
+    if identifiers and any(identifier in condensed.lower() for identifier in identifiers):
+        joined = ", ".join(f"`{identifier}`" for identifier in identifiers[:2])
+        return f"- `{file_path}` includes implementation detail tied to {joined}, so it is part of the retrieved cross-file evidence."
     if condensed:
         preview = condensed[:120].rstrip()
         if len(condensed) > 120:
