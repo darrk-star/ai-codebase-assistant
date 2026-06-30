@@ -367,6 +367,9 @@ def _build_typed_answer(
         composite_answer = _build_composite_entity_location_answer(source_paths, evidence_blocks, question)
         if composite_answer:
             return composite_answer
+        config_answer = _build_config_entity_location_answer(source_paths, evidence_blocks, question)
+        if config_answer:
+            return config_answer
         location = source_paths[0] if source_paths else "the retrieved repository context"
         why_lines = _build_evidence_why_lines(evidence_blocks)
         if not why_lines:
@@ -432,6 +435,65 @@ def _build_evidence_why_lines(evidence_blocks: list[dict[str, str]], limit: int 
     return why_lines
 
 
+def _build_config_entity_location_answer(
+    source_paths: list[str],
+    evidence_blocks: list[dict[str, str]],
+    question: str,
+) -> str:
+    question_lower = question.lower()
+    config_query = any(token in question_lower for token in ("setting", "configured", "config", "environment", "base url"))
+    if not config_query:
+        return ""
+
+    normalized_sources = [path.replace("\\", "/") for path in source_paths]
+    evidence_by_path = {
+        str(item.get("file_path", "")).replace("\\", "/"): item
+        for item in evidence_blocks
+        if str(item.get("file_path", "")).strip()
+    }
+
+    config_path = next((path for path in normalized_sources if path.endswith("config.py")), "")
+    if not config_path:
+        config_path = next((path for path in evidence_by_path if path.endswith("config.py")), "")
+    if not config_path:
+        return ""
+
+    config_target = _extract_config_target(question, evidence_blocks)
+    answer_line = f"Answer: The most relevant location for this question is `{config_path}`."
+    if config_target:
+        answer_line = f"Answer: `{config_target}` is configured in `{config_path}`."
+
+    why_lines: list[str] = []
+    config_snippet = str(evidence_by_path.get(config_path, {}).get("snippet", ""))
+    config_detail = _describe_config_definition_evidence(config_path, config_snippet, config_target)
+    if config_detail:
+        why_lines.append(config_detail)
+
+    for path in normalized_sources:
+        if path == config_path:
+            continue
+        snippet = str(evidence_by_path.get(path, {}).get("snippet", ""))
+        consumer_detail = _describe_config_consumer_evidence(path, snippet)
+        if consumer_detail:
+            why_lines.append(consumer_detail)
+        if len(why_lines) >= 3:
+            break
+
+    if not why_lines:
+        why_lines = [f"- `{config_path}` contains the strongest configuration definition match for this question."]
+
+    focused_sources = [config_path]
+    for path in normalized_sources:
+        if path != config_path and path.endswith("main.py"):
+            focused_sources.append(path)
+            break
+    return _format_typed_answer(
+        answer_line=answer_line,
+        why_lines=why_lines[:3],
+        source_paths=list(dict.fromkeys(focused_sources)),
+    )
+
+
 def _build_flow_evidence_why_lines(
     evidence_blocks: list[dict[str, str]],
     limit: int = 3,
@@ -460,6 +522,56 @@ def _build_relationship_evidence_why_lines(
         snippet = str(item.get("snippet", "")).strip()
         why_lines.append(_describe_relationship_evidence(file_path, snippet, identifiers))
     return why_lines
+
+
+def _extract_config_target(question: str, evidence_blocks: list[dict[str, str]]) -> str:
+    explicit_targets = re.findall(r"\b[A-Z][A-Z0-9_]*_[A-Z0-9_]+\b", question)
+    if explicit_targets:
+        return explicit_targets[0]
+
+    for item in evidence_blocks:
+        snippet = str(item.get("snippet", ""))
+        getenv_match = re.search(r"os\.getenv\(\s*['\"]([A-Z][A-Z0-9_]{2,})['\"]", snippet)
+        if getenv_match:
+            return getenv_match.group(1)
+    return ""
+
+
+def _describe_config_definition_evidence(file_path: str, snippet: str, config_target: str) -> str:
+    snippet_lower = snippet.lower()
+    getenv_match = None
+    if config_target:
+        getenv_match = re.search(
+            r"os\.getenv\(\s*['\"]("
+            + re.escape(config_target)
+            + r")['\"](?:\s*,\s*([^)]+))?\)",
+            snippet,
+        )
+    if getenv_match is None:
+        getenv_match = re.search(r"os\.getenv\(\s*['\"]([^'\"]+)['\"](?:\s*,\s*([^)]+))?\)", snippet)
+    if getenv_match:
+        env_name = getenv_match.group(1)
+        default_value = (getenv_match.group(2) or "").strip()
+        if default_value:
+            return f"- `{file_path}` reads `os.getenv(\"{env_name}\", {default_value})` in its config-loading path."
+        return f"- `{file_path}` reads `os.getenv(\"{env_name}\")` in its config-loading path."
+    if "from_env" in snippet_lower:
+        target = config_target or "the configuration value"
+        return f"- `{file_path}` defines `from_env()`, which loads `{target}`."
+    if config_target and config_target.lower() in snippet_lower:
+        return f"- `{file_path}` contains the definition path for `{config_target}`."
+    return f"- `{file_path}` contains the strongest configuration definition match for this question."
+
+
+def _describe_config_consumer_evidence(file_path: str, snippet: str) -> str:
+    snippet_lower = snippet.lower()
+    if "appconfig.from_env" in snippet_lower:
+        return f"- `{file_path}` calls `AppConfig.from_env()` to consume the config, but does not define the value itself."
+    if "from_env(" in snippet_lower:
+        return f"- `{file_path}` calls `from_env()` to consume the config, but does not define the value itself."
+    if "config =" in snippet_lower and "from_env" in snippet_lower:
+        return f"- `{file_path}` consumes the loaded config object, rather than defining the setting."
+    return ""
 
 
 def _build_relationship_answer_line(

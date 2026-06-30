@@ -202,7 +202,7 @@ def test_suggested_questions_cover_multiple_question_types() -> None:
     prompts = ui.DEFAULT_SUGGESTED_QUESTIONS
 
     assert "How is the weekly digest built?" in prompts
-    assert "Where is the Ollama base URL configured?" in prompts
+    assert "Which configuration values are defined in this project?" in prompts
     assert "What calls summarize_workflow_runs across files?" in prompts
     assert "What design risks do you see in this project?" in prompts
 
@@ -238,6 +238,8 @@ def test_suggested_questions_for_repo_uses_detected_repo_signals(tmp_path: Path)
     (app_dir / "charts.py").write_text("def write_failure_trend_chart(*args):\n    return True\n", encoding="utf-8")
     (app_dir / "ci_failure_analysis.py").write_text("patterns = [('unknown_failure', ['error'])]\n", encoding="utf-8")
 
+    ui._build_repo_profile.cache_clear()
+    ui._recommended_question_entries.cache_clear()
     ui._suggested_questions_for_repo.cache_clear()
     prompts = ui._suggested_questions_for_repo(tmp_path)
 
@@ -245,7 +247,7 @@ def test_suggested_questions_for_repo_uses_detected_repo_signals(tmp_path: Path)
     assert prompts[1] == "Which file fetches GitHub workflow runs and where are they summarized?"
     assert prompts[2] == "What calls summarize_workflow_runs across files?"
     assert "Which file contains argparse and the main function?" in prompts
-    assert "Where is the Ollama base URL configured?" in prompts
+    assert "Where is `OLLAMA_BASE_URL` configured?" in prompts
     assert "How is the summary report built?" in prompts
     assert "Where are CI charts generated?" in prompts
     assert "What design risks do you see in this project?" in prompts
@@ -282,8 +284,11 @@ def test_build_repo_profile_extracts_core_repo_signals(tmp_path: Path) -> None:
     profile = ui._build_repo_profile(tmp_path)
 
     assert profile["has_entrypoint"] is True
+    assert "app/main.py" in profile["entrypoint_reason"]
     assert profile["config_target"] == "OLLAMA_BASE_URL"
+    assert "app/config.py" in profile["config_reason"]
     assert profile["relationship_target"] == "summarize_workflow_runs"
+    assert "app/main.py" in profile["relationship_reason"]
     assert profile["has_workflow_fetch_and_summary"] is True
     assert profile["has_weekly_digest"] is True
     assert profile["has_summary_report"] is True
@@ -292,10 +297,116 @@ def test_build_repo_profile_extracts_core_repo_signals(tmp_path: Path) -> None:
 
 
 def test_suggested_questions_for_repo_falls_back_to_defaults(tmp_path: Path) -> None:
+    ui._build_repo_profile.cache_clear()
+    ui._recommended_question_entries.cache_clear()
     ui._suggested_questions_for_repo.cache_clear()
     prompts = ui._suggested_questions_for_repo(tmp_path)
 
     assert prompts == ui.DEFAULT_SUGGESTED_QUESTIONS
+
+
+def test_recommended_question_entries_include_implementation_reasons(tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text(
+        "import argparse\n"
+        "from app.metrics import summarize_workflow_runs\n"
+        "def parse_args():\n"
+        "    return argparse.ArgumentParser()\n"
+        "def main():\n"
+        "    summarize_workflow_runs([])\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    (app_dir / "config.py").write_text("OLLAMA_BASE_URL = 'http://localhost:11434'\n", encoding="utf-8")
+    (app_dir / "metrics.py").write_text(
+        "def summarize_workflow_runs(records):\n"
+        "    workflow_failures = {}\n"
+        "    return workflow_failures\n",
+        encoding="utf-8",
+    )
+    (app_dir / "github_client.py").write_text("def fetch_workflow_runs():\n    return []\n", encoding="utf-8")
+    (app_dir / "report.py").write_text(
+        "def write_weekly_digest_report(*args):\n    return 'outputs/weekly_digest.md'\n",
+        encoding="utf-8",
+    )
+
+    ui._build_repo_profile.cache_clear()
+    ui._recommended_question_entries.cache_clear()
+    entries = ui._recommended_question_entries(tmp_path)
+
+    entry_map = {entry["prompt"]: entry["reason"] for entry in entries}
+    assert "app/report.py" in entry_map["How is the weekly digest built?"]
+    assert "`summarize_workflow_runs()` is defined in `app/metrics.py` and called from `app/main.py`." == entry_map[
+        "What calls summarize_workflow_runs across files?"
+    ]
+    assert "app/config.py" in entry_map["Where is `OLLAMA_BASE_URL` configured?"]
+
+
+def test_recommended_questions_skip_irrelevant_ollama_fallback(tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text(
+        "import argparse\n"
+        "from app.metrics import summarize_workflow_runs\n"
+        "def main():\n"
+        "    summarize_workflow_runs([])\n",
+        encoding="utf-8",
+    )
+    (app_dir / "config.py").write_text(
+        "GITHUB_API_BASE = 'https://api.github.com'\n"
+        "GITHUB_TOKEN = None\n",
+        encoding="utf-8",
+    )
+    (app_dir / "metrics.py").write_text(
+        "def summarize_workflow_runs(records):\n"
+        "    category_counts = {}\n"
+        "    return category_counts\n",
+        encoding="utf-8",
+    )
+    (app_dir / "github_client.py").write_text("def fetch_workflow_runs():\n    return []\n", encoding="utf-8")
+    (app_dir / "report.py").write_text(
+        "def write_weekly_digest_report(*args):\n    return 'outputs/weekly_digest.md'\n"
+        "def write_markdown_report(*args):\n    return 'outputs/summary.md'\n",
+        encoding="utf-8",
+    )
+    (app_dir / "charts.py").write_text("def write_failure_trend_chart(*args):\n    return True\n", encoding="utf-8")
+
+    ui._build_repo_profile.cache_clear()
+    ui._recommended_question_entries.cache_clear()
+    ui._suggested_questions_for_repo.cache_clear()
+    prompts = ui._suggested_questions_for_repo(tmp_path)
+
+    assert "Where is `OLLAMA_BASE_URL` configured?" not in prompts
+    assert "Where is `GITHUB_API_BASE` configured?" in prompts
+    assert prompts.index("Where is `GITHUB_API_BASE` configured?") < 5
+
+
+def test_build_repo_profile_detects_env_backed_config_targets(tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "config.py").write_text(
+        "import os\n"
+        "from dataclasses import dataclass\n"
+        "@dataclass(frozen=True)\n"
+        "class AppConfig:\n"
+        "    github_token: str | None = None\n"
+        "    github_api_base: str = 'https://api.github.com'\n"
+        "    @classmethod\n"
+        "    def from_env(cls):\n"
+        "        return cls(\n"
+        "            github_token=os.getenv('GITHUB_TOKEN') or None,\n"
+        "            github_api_base=os.getenv('GITHUB_API_BASE', 'https://api.github.com'),\n"
+        "        )\n",
+        encoding="utf-8",
+    )
+
+    ui._build_repo_profile.cache_clear()
+    profile = ui._build_repo_profile(tmp_path)
+
+    assert profile["config_target"] == "GITHUB_API_BASE"
+    assert "env config" in profile["config_reason"]
 
 
 def test_queue_question_stores_pending_prompt_and_user_message(monkeypatch, tmp_path: Path) -> None:

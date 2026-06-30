@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import ast
 from functools import lru_cache
 from pathlib import Path
 import re
@@ -23,7 +24,7 @@ load_dotenv()
 DEFAULT_SUGGESTED_QUESTIONS = (
     "How is the weekly digest built?",
     "How is the summary report built?",
-    "Where is the Ollama base URL configured?",
+    "Which configuration values are defined in this project?",
     "Which file contains argparse and the main function?",
     "What calls summarize_workflow_runs across files?",
     "Which file fetches GitHub workflow runs and where are they summarized?",
@@ -33,6 +34,10 @@ DEFAULT_SUGGESTED_QUESTIONS = (
 
 
 class RepoProfile(dict[str, object]):
+    pass
+
+
+class PythonFileFacts(dict[str, object]):
     pass
 
 APP_BUILD_TAG = "relationship-filter-v5"
@@ -169,8 +174,10 @@ def main() -> None:
 
     st.markdown("### Suggested questions")
     q_col1, q_col2 = st.columns(2, gap="large")
-    suggested_questions = _suggested_questions_for_repo(repo_path)
-    for idx, prompt in enumerate(suggested_questions):
+    suggested_entries = _recommended_question_entries(repo_path)
+    suggested_questions = tuple(entry["prompt"] for entry in suggested_entries)
+    for idx, entry in enumerate(suggested_entries):
+        prompt = str(entry["prompt"])
         target_column = q_col1 if idx % 2 == 0 else q_col2
         with target_column:
             if st.button(
@@ -180,6 +187,17 @@ def main() -> None:
                 disabled=workspace["index"] is None or question_busy,
             ):
                 _queue_question(prompt, repo_path)
+    if suggested_entries:
+        with st.expander("Why these questions were recommended"):
+            reason_col1, reason_col2 = st.columns(2, gap="large")
+            for idx, entry in enumerate(suggested_entries):
+                prompt = str(entry["prompt"])
+                reason = str(entry.get("reason", "")).strip()
+                target_column = reason_col1 if idx % 2 == 0 else reason_col2
+                with target_column:
+                    st.markdown(f"**{prompt}**")
+                    if reason:
+                        st.caption(reason)
 
     st.markdown("### Conversation")
 
@@ -293,64 +311,130 @@ def _render_message_content(content: str, role: str) -> None:
 
 @lru_cache(maxsize=16)
 def _suggested_questions_for_repo(repo_path: Path) -> tuple[str, ...]:
+    return tuple(entry["prompt"] for entry in _recommended_question_entries(repo_path))
+
+
+@lru_cache(maxsize=16)
+def _recommended_question_entries(repo_path: Path) -> tuple[dict[str, str], ...]:
     profile = _build_repo_profile(repo_path)
     if not profile:
-        return DEFAULT_SUGGESTED_QUESTIONS
+        return tuple(
+            {"prompt": prompt, "reason": "Default fallback because no repository signals were detected."}
+            for prompt in DEFAULT_SUGGESTED_QUESTIONS
+        )
 
-    prompt_scores: dict[str, int] = {}
+    prompt_entries: dict[str, dict[str, str | int]] = {}
 
-    def add_prompt(prompt: str, score: int) -> None:
+    def add_prompt(prompt: str, score: int, reason: str) -> None:
         if not prompt.strip():
             return
-        existing = prompt_scores.get(prompt)
-        if existing is None or score > existing:
-            prompt_scores[prompt] = score
+        existing = prompt_entries.get(prompt)
+        if existing is None or score > int(existing["score"]):
+            prompt_entries[prompt] = {"prompt": prompt, "score": score, "reason": reason}
 
     if profile.get("has_entrypoint"):
-        add_prompt("Which file contains argparse and the main function?", 60)
+        add_prompt(
+            "Which file contains argparse and the main function?",
+            60,
+            str(profile.get("entrypoint_reason", "")),
+        )
 
     config_target = str(profile.get("config_target", "")).strip()
     if config_target:
-        if "base_url" in config_target.lower():
-            add_prompt("Where is the Ollama base URL configured?", 80)
-        else:
-            add_prompt(f"Where is `{config_target}` configured?", 70)
+        config_reason = str(profile.get("config_reason", "")).strip()
+        add_prompt(_config_question_for_target(config_target), 89, config_reason)
 
     relationship_target = str(profile.get("relationship_target", "")).strip()
     if relationship_target:
         relationship_score = 90 if relationship_target == "summarize_workflow_runs" else 75
-        add_prompt(f"What calls {relationship_target} across files?", relationship_score)
+        add_prompt(
+            f"What calls {relationship_target} across files?",
+            relationship_score,
+            str(profile.get("relationship_reason", "")),
+        )
 
     if profile.get("has_workflow_fetch_and_summary"):
-        add_prompt("Which file fetches GitHub workflow runs and where are they summarized?", 95)
+        add_prompt(
+            "Which file fetches GitHub workflow runs and where are they summarized?",
+            95,
+            str(profile.get("workflow_reason", "")),
+        )
 
     if profile.get("has_weekly_digest"):
-        add_prompt("How is the weekly digest built?", 100)
+        add_prompt("How is the weekly digest built?", 100, str(profile.get("weekly_digest_reason", "")))
 
     if profile.get("has_summary_report"):
-        add_prompt("How is the summary report built?", 85)
+        add_prompt("How is the summary report built?", 85, str(profile.get("summary_report_reason", "")))
 
     if profile.get("has_ci_charts"):
-        add_prompt("Where are CI charts generated?", 65)
+        add_prompt("Where are CI charts generated?", 65, str(profile.get("ci_charts_reason", "")))
 
     if profile.get("has_design_risk_signals"):
-        add_prompt("What design risks do you see in this project?", 88)
+        add_prompt("What design risks do you see in this project?", 88, str(profile.get("design_risk_reason", "")))
 
     merged = [
-        prompt
+        prompt_entries[prompt]
         for prompt, _ in sorted(
-            prompt_scores.items(),
-            key=lambda item: (-item[1], item[0]),
+            prompt_entries.items(),
+            key=lambda item: (-int(item[1]["score"]), item[0]),
         )
     ]
     if not merged:
-        return DEFAULT_SUGGESTED_QUESTIONS
-    for fallback in DEFAULT_SUGGESTED_QUESTIONS:
-        if fallback not in merged:
-            merged.append(fallback)
+        return tuple(
+            {"prompt": prompt, "reason": "Default fallback because no repository signals were detected."}
+            for prompt in DEFAULT_SUGGESTED_QUESTIONS
+        )
+    merged_prompts = {str(entry["prompt"]) for entry in merged}
+    for fallback in _fallback_questions_for_profile(profile):
+        if fallback not in merged_prompts:
+            merged.append(
+                {
+                    "prompt": fallback,
+                    "score": 0,
+                    "reason": "Default fallback matched to the repository signals already detected.",
+                }
+            )
         if len(merged) >= 8:
             break
-    return tuple(merged[:8])
+    return tuple({"prompt": str(entry["prompt"]), "reason": str(entry["reason"])} for entry in merged[:8])
+
+
+def _fallback_questions_for_profile(profile: RepoProfile) -> tuple[str, ...]:
+    fallbacks: list[str] = []
+    config_target = str(profile.get("config_target", "")).strip()
+
+    if profile.get("has_weekly_digest"):
+        fallbacks.append("How is the weekly digest built?")
+    if profile.get("has_workflow_fetch_and_summary"):
+        fallbacks.append("Which file fetches GitHub workflow runs and where are they summarized?")
+    if profile.get("relationship_target"):
+        relationship_target = str(profile.get("relationship_target", "")).strip()
+        if relationship_target:
+            fallbacks.append(f"What calls {relationship_target} across files?")
+    if profile.get("has_design_risk_signals"):
+        fallbacks.append("What design risks do you see in this project?")
+    if profile.get("has_summary_report"):
+        fallbacks.append("How is the summary report built?")
+    if profile.get("has_ci_charts"):
+        fallbacks.append("Where are CI charts generated?")
+    if profile.get("has_entrypoint"):
+        fallbacks.append("Which file contains argparse and the main function?")
+    if config_target:
+        fallbacks.append(_config_question_for_target(config_target))
+
+    for prompt in DEFAULT_SUGGESTED_QUESTIONS:
+        if prompt not in fallbacks:
+            fallbacks.append(prompt)
+        if len(fallbacks) >= 8:
+            break
+    return tuple(fallbacks[:8])
+
+
+def _config_question_for_target(config_target: str) -> str:
+    cleaned_target = config_target.strip()
+    if not cleaned_target:
+        return "Which configuration values are defined in this project?"
+    return f"Where is `{cleaned_target}` configured?"
 
 
 @lru_cache(maxsize=16)
@@ -359,57 +443,307 @@ def _build_repo_profile(repo_path: Path) -> RepoProfile:
     if not repo_root.exists() or not repo_root.is_dir():
         return RepoProfile()
 
-    app_dir = repo_root / "app"
-    main_path = app_dir / "main.py"
-    config_path = app_dir / "config.py"
-    metrics_path = app_dir / "metrics.py"
-    github_client_path = app_dir / "github_client.py"
-    report_path = app_dir / "report.py"
-    charts_path = app_dir / "charts.py"
-    risk_path = repo_root / "app" / "ci_failure_analysis.py"
+    python_facts = _collect_python_file_facts(repo_root)
+    if not python_facts:
+        return RepoProfile()
+
+    main_facts = python_facts.get("app/main.py")
+    config_facts = python_facts.get("app/config.py")
+    metrics_facts = python_facts.get("app/metrics.py")
+    github_client_facts = python_facts.get("app/github_client.py")
+    report_facts = python_facts.get("app/report.py")
+    charts_facts = python_facts.get("app/charts.py")
+    risk_facts = python_facts.get("app/ci_failure_analysis.py")
+
+    has_entrypoint = False
+    entrypoint_reason = ""
+    if main_facts:
+        has_entrypoint = bool(main_facts.get("has_argparse_import")) and (
+            bool(main_facts.get("has_main_function"))
+            or bool(main_facts.get("has_parse_args_function"))
+            or bool(main_facts.get("has_main_guard"))
+        )
+        if has_entrypoint:
+            entrypoint_reason = "Found `argparse` and entrypoint flow in `app/main.py` (`parse_args`, `main`, `__main__`)."
+
+    config_target = ""
+    config_reason = ""
+    if config_facts:
+        assigned_names = tuple(config_facts.get("assigned_names", ()))
+        env_var_names = tuple(config_facts.get("env_var_names", ()))
+        config_target = _pick_first_name(
+            env_var_names,
+            ("OLLAMA_BASE_URL", "OLLAMA_CHAT_MODEL", "GITHUB_API_BASE", "GITHUB_TOKEN"),
+        )
+        if not config_target:
+            config_target = _pick_first_name(
+                assigned_names,
+                ("OLLAMA_BASE_URL", "ollama_base_url", "OLLAMA_CHAT_MODEL"),
+            )
+        if not config_target:
+            config_target = _pick_first_name(
+                env_var_names,
+                tuple(name for name in env_var_names if "ollama" in name.lower() or "base_url" in name.lower()),
+            )
+        if not config_target:
+            config_target = _pick_first_name(
+                assigned_names,
+                tuple(name for name in assigned_names if "ollama" in name.lower() or "base_url" in name.lower()),
+            )
+        if not config_target:
+            config_target = _pick_first_name(
+                env_var_names,
+                tuple(
+                    name
+                    for name in env_var_names
+                    if name.isupper() and any(token in name for token in ("URL", "BASE", "TOKEN", "MODEL", "API", "KEY"))
+                ),
+            )
+        if not config_target:
+            config_target = _pick_first_name(
+                assigned_names,
+                tuple(
+                    name
+                    for name in assigned_names
+                    if name.isupper() and any(token in name for token in ("URL", "BASE", "TOKEN", "MODEL", "API", "KEY"))
+                ),
+            )
+        if not config_target:
+            config_target = _pick_first_name(
+                assigned_names,
+                tuple(
+                    name
+                    for name in assigned_names
+                    if any(token in name.lower() for token in ("base", "url", "token", "model", "api", "key"))
+                ),
+            )
+        if config_target:
+            if config_target in env_var_names:
+                config_reason = f"Found env config `{config_target}` in `app/config.py`."
+            else:
+                config_reason = f"Found `{config_target}` in `app/config.py`."
+
+    relationship_target = ""
+    relationship_reason = ""
+    metrics_defs = tuple(metrics_facts.get("function_defs", ())) if metrics_facts else ()
+    main_calls = tuple(main_facts.get("calls", ())) if main_facts else ()
+    for candidate in ("summarize_workflow_runs", "build_weekly_ci_digest", "summarize_pull_requests"):
+        if candidate in metrics_defs and candidate in main_calls:
+            relationship_target = candidate
+            relationship_reason = f"`{candidate}()` is defined in `app/metrics.py` and called from `app/main.py`."
+            break
+    if not relationship_target:
+        for candidate in ("summarize_workflow_runs", "build_weekly_ci_digest", "summarize_pull_requests"):
+            if candidate in metrics_defs:
+                relationship_target = candidate
+                relationship_reason = f"Found `{candidate}()` in `app/metrics.py`."
+                break
+
+    has_workflow_fetch_and_summary = bool(github_client_facts and metrics_facts) and (
+        "fetch_workflow_runs" in tuple(github_client_facts.get("function_defs", ()))
+        and "summarize_workflow_runs" in metrics_defs
+    )
+    workflow_reason = ""
+    if has_workflow_fetch_and_summary:
+        workflow_reason = "`fetch_workflow_runs()` is in `app/github_client.py`; `summarize_workflow_runs()` is in `app/metrics.py`."
+
+    has_weekly_digest = False
+    weekly_digest_reason = ""
+    has_summary_report = False
+    summary_report_reason = ""
+    if report_facts:
+        report_defs = set(report_facts.get("function_defs", ()))
+        report_strings = set(report_facts.get("string_literals", ()))
+        has_weekly_digest = "write_weekly_digest_report" in report_defs or "weekly_digest.md" in report_strings
+        has_summary_report = "write_markdown_report" in report_defs or "summary.md" in report_strings
+        if has_weekly_digest:
+            weekly_digest_reason = "Found `write_weekly_digest_report()` and `weekly_digest.md` in `app/report.py`."
+        if has_summary_report:
+            summary_report_reason = "Found `write_markdown_report()` and `summary.md` in `app/report.py`."
+
+    has_ci_charts = False
+    ci_charts_reason = ""
+    if charts_facts:
+        chart_defs = set(charts_facts.get("function_defs", ()))
+        has_ci_charts = bool({"write_failure_trend_chart", "write_failed_workflow_chart"} & chart_defs)
+        if has_ci_charts:
+            ci_charts_reason = "Found CI chart writers in `app/charts.py`."
+
+    has_design_risk_signals = False
+    design_risk_reason = ""
+    if metrics_facts:
+        metrics_names = set(metrics_facts.get("assigned_names", ())) | set(metrics_facts.get("name_refs", ()))
+        if {"category_counts", "workflow_failures"} & metrics_names:
+            has_design_risk_signals = True
+            design_risk_reason = "Found centralized failure buckets like `category_counts` or `workflow_failures` in `app/metrics.py`."
+    if not has_design_risk_signals and risk_facts:
+        risk_names = set(risk_facts.get("assigned_names", ())) | set(risk_facts.get("name_refs", ()))
+        risk_strings = set(risk_facts.get("string_literals", ()))
+        if "patterns" in risk_names or {"permission_failure", "unknown_failure"} & risk_strings:
+            has_design_risk_signals = True
+            design_risk_reason = "Found rule-based failure buckets in `app/ci_failure_analysis.py`."
 
     return RepoProfile(
-        has_entrypoint=_file_contains(main_path, ("argparse", "ArgumentParser", "def main(")),
-        config_target=_pick_first_identifier(
-            config_path,
-            ("OLLAMA_BASE_URL", "ollama_base_url", "OLLAMA_CHAT_MODEL"),
-        ),
-        relationship_target=_pick_first_identifier(
-            metrics_path,
-            ("summarize_workflow_runs", "build_weekly_ci_digest", "summarize_pull_requests"),
-        ),
-        has_workflow_fetch_and_summary=_file_contains(github_client_path, ("fetch_workflow_runs",))
-        and _file_contains(metrics_path, ("summarize_workflow_runs",)),
-        has_weekly_digest=_file_contains(report_path, ("write_weekly_digest_report", "weekly_digest.md")),
-        has_summary_report=_file_contains(report_path, ("write_markdown_report", "summary.md")),
-        has_ci_charts=_file_contains(charts_path, ("write_failure_trend_chart", "write_failed_workflow_chart")),
-        has_design_risk_signals=_file_contains(metrics_path, ("category_counts", "workflow_failures"))
-        or _file_contains(risk_path, ("patterns", "permission_failure", "unknown_failure")),
+        has_entrypoint=has_entrypoint,
+        entrypoint_reason=entrypoint_reason,
+        config_target=config_target,
+        config_reason=config_reason,
+        relationship_target=relationship_target,
+        relationship_reason=relationship_reason,
+        has_workflow_fetch_and_summary=has_workflow_fetch_and_summary,
+        workflow_reason=workflow_reason,
+        has_weekly_digest=has_weekly_digest,
+        weekly_digest_reason=weekly_digest_reason,
+        has_summary_report=has_summary_report,
+        summary_report_reason=summary_report_reason,
+        has_ci_charts=has_ci_charts,
+        ci_charts_reason=ci_charts_reason,
+        has_design_risk_signals=has_design_risk_signals,
+        design_risk_reason=design_risk_reason,
     )
 
 
-def _file_contains(path: Path, patterns: tuple[str, ...]) -> bool:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+def _collect_python_file_facts(repo_root: Path) -> dict[str, PythonFileFacts]:
+    facts_by_file: dict[str, PythonFileFacts] = {}
+    for path in repo_root.rglob("*.py"):
         try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            return False
-    return any(pattern in text for pattern in patterns)
+            relative_path = path.relative_to(repo_root).as_posix()
+        except ValueError:
+            continue
+        facts = _parse_python_file_facts(path)
+        if facts:
+            facts_by_file[relative_path] = facts
+    return facts_by_file
 
 
-def _pick_first_identifier(path: Path, candidates: tuple[str, ...]) -> str:
+def _parse_python_file_facts(path: Path) -> PythonFileFacts:
     try:
-        text = path.read_text(encoding="utf-8")
+        source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            source = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
-            return ""
-    for candidate in candidates:
-        if candidate in text:
-            return candidate
+            return PythonFileFacts()
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return PythonFileFacts()
+
+    function_defs: list[str] = []
+    assigned_names: list[str] = []
+    calls: list[str] = []
+    name_refs: list[str] = []
+    string_literals: list[str] = []
+    imports: list[str] = []
+    env_var_names: list[str] = []
+    has_main_guard = False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function_defs.append(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                assigned_names.extend(_extract_assigned_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            assigned_names.extend(_extract_assigned_names(node.target))
+        elif isinstance(node, ast.Call):
+            call_name = _call_name(node.func)
+            if call_name:
+                calls.append(call_name)
+            env_name = _env_var_name(node)
+            if env_name:
+                env_var_names.append(env_name)
+        elif isinstance(node, ast.Name):
+            name_refs.append(node.id)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            string_literals.append(node.value)
+        elif isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imports.append(node.module)
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.If) and _is_main_guard(node.test):
+            has_main_guard = True
+
+    unique_function_defs = tuple(dict.fromkeys(function_defs))
+    unique_assigned_names = tuple(dict.fromkeys(assigned_names))
+    unique_calls = tuple(dict.fromkeys(calls))
+    unique_name_refs = tuple(dict.fromkeys(name_refs))
+    unique_string_literals = tuple(dict.fromkeys(string_literals))
+    unique_imports = tuple(dict.fromkeys(imports))
+    unique_env_var_names = tuple(dict.fromkeys(env_var_names))
+
+    return PythonFileFacts(
+        function_defs=unique_function_defs,
+        assigned_names=unique_assigned_names,
+        calls=unique_calls,
+        name_refs=unique_name_refs,
+        string_literals=unique_string_literals,
+        imports=unique_imports,
+        env_var_names=unique_env_var_names,
+        has_argparse_import=any(name == "argparse" or name.endswith(".argparse") for name in unique_imports)
+        or "ArgumentParser" in unique_name_refs,
+        has_main_function="main" in unique_function_defs,
+        has_parse_args_function="parse_args" in unique_function_defs,
+        has_main_guard=has_main_guard,
+    )
+
+
+def _extract_assigned_names(target: ast.expr) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for element in target.elts:
+            names.extend(_extract_assigned_names(element))
+        return names
+    return []
+
+
+def _call_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _env_var_name(node: ast.Call) -> str:
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return ""
+    if func.attr != "getenv":
+        return ""
+    if not node.args:
+        return ""
+    first_arg = node.args[0]
+    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+        return first_arg.value
+    return ""
+
+
+def _is_main_guard(node: ast.expr) -> bool:
+    if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
+        return False
+    if not isinstance(node.ops[0], ast.Eq):
+        return False
+    left = node.left
+    right = node.comparators[0]
+    return (
+        isinstance(left, ast.Name)
+        and left.id == "__name__"
+        and isinstance(right, ast.Constant)
+        and right.value == "__main__"
+    )
+
+
+def _pick_first_name(candidates: tuple[str, ...], preferred_order: tuple[str, ...]) -> str:
+    candidate_set = {candidate for candidate in candidates if candidate}
+    for preferred in preferred_order:
+        if preferred in candidate_set:
+            return preferred
     return ""
 
 

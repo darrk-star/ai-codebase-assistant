@@ -186,14 +186,16 @@ def test_finalize_answer_formats_entity_location_question() -> None:
         answer_text="app/config.py contains the setting.",
         source_paths=["app/config.py", "app/main.py"],
         evidence_blocks=[
-            {"file_path": "app/config.py", "reason": "Keyword-based code match", "snippet": "OLLAMA_BASE_URL"},
+            {"file_path": "app/config.py", "reason": "Keyword-based code match", "snippet": "ollama_base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')"},
+            {"file_path": "app/main.py", "reason": "Keyword-based code match", "snippet": "config = AppConfig.from_env()"},
         ],
         question="Where is the Ollama base URL configured?",
         call_chain_summary="",
     )
 
-    assert "Answer: The most relevant location for this question is `app/config.py`." in result
-    assert "- `app/config.py`: Keyword-based code match" in result
+    assert "Answer: `OLLAMA_BASE_URL` is configured in `app/config.py`." in result
+    assert '`app/config.py` reads `os.getenv("OLLAMA_BASE_URL", ' in result
+    assert "`app/main.py` calls `AppConfig.from_env()` to consume the config, but does not define the value itself." in result
 
 
 def test_finalize_answer_formats_composite_entity_location_question() -> None:
@@ -772,6 +774,64 @@ def test_filter_evidence_for_entity_location_keeps_strongest_config_matches() ->
     )
 
     assert [item["file_path"] for item in filtered] == ["app/config.py", "app/main.py"]
+
+
+def test_finalize_answer_formats_env_backed_config_location_question() -> None:
+    result = qa._finalize_answer(
+        answer_text="app/config.py contains the setting.",
+        source_paths=["app/config.py", "app/main.py"],
+        evidence_blocks=[
+            {
+                "file_path": "app/config.py",
+                "reason": "Keyword-based code match",
+                "snippet": (
+                    "def from_env(cls):\n"
+                    "    return cls(github_api_base=os.getenv('GITHUB_API_BASE', 'https://api.github.com'))"
+                ),
+            },
+            {
+                "file_path": "app/main.py",
+                "reason": "Keyword-based code match",
+                "snippet": "config = AppConfig.from_env()",
+            },
+        ],
+        question="Where is GITHUB_API_BASE configured?",
+        call_chain_summary="",
+    )
+
+    assert "Answer: `GITHUB_API_BASE` is configured in `app/config.py`." in result
+    assert '`app/config.py` reads `os.getenv("GITHUB_API_BASE", ' in result
+    assert "`app/main.py` calls `AppConfig.from_env()` to consume the config, but does not define the value itself." in result
+
+
+def test_finalize_answer_prefers_target_env_var_when_multiple_getenv_calls_exist() -> None:
+    result = qa._finalize_answer(
+        answer_text="app/config.py contains the setting.",
+        source_paths=["app/config.py", "app/main.py"],
+        evidence_blocks=[
+            {
+                "file_path": "app/config.py",
+                "reason": "Keyword-based code match",
+                "snippet": (
+                    "def from_env(cls):\n"
+                    "    return cls(\n"
+                    "        github_token=os.getenv('GITHUB_TOKEN') or None,\n"
+                    "        github_api_base=os.getenv('GITHUB_API_BASE', 'https://api.github.com'),\n"
+                    "    )"
+                ),
+            },
+            {
+                "file_path": "app/main.py",
+                "reason": "Keyword-based code match",
+                "snippet": "config = AppConfig.from_env()",
+            },
+        ],
+        question="Where is GITHUB_API_BASE configured?",
+        call_chain_summary="",
+    )
+
+    assert '`app/config.py` reads `os.getenv("GITHUB_API_BASE", ' in result
+    assert "GITHUB_TOKEN" not in result.split("Why:\n", 1)[1].split("\n", 1)[0]
 
 
 def test_filter_entity_location_for_argparse_prefers_main_over_config() -> None:
