@@ -4,12 +4,15 @@ import ast
 from functools import lru_cache
 from pathlib import Path
 import re
+import subprocess
 import sys
+from urllib.parse import urlparse
 
 import streamlit as st
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CLONED_REPOS_ROOT = PROJECT_ROOT / ".repos"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -100,6 +103,8 @@ def main() -> None:
 
     config = AppConfig.from_env()
     _init_session_state()
+    _apply_pending_repo_input_value()
+    _apply_pending_workspace_selector()
 
     default_repo = str((Path(__file__).resolve().parents[2] / "github-efficiency-analyzer").resolve())
     active_repo = _get_active_repo(default_repo)
@@ -117,15 +122,22 @@ def main() -> None:
             key="workspace_selector",
             on_change=_handle_workspace_change,
         )
-        repo_input = st.text_input("Repository path", key="repo_input_value")
-        repo_path = Path(repo_input).resolve()
-        repo_ready, repo_status_message = _validate_repo_path(repo_path)
+        repo_input = st.text_input("Repository path or GitHub URL", key="repo_input_value")
+        repo_path, repo_spec = _resolve_repo_input(repo_input)
+        repo_ready, repo_status_message = _validate_repo_input(repo_input, repo_path, repo_spec)
         index_dir = config.resolve_index_dir(repo_path)
         persisted_index_exists = index_dir.exists()
         rebuild = st.checkbox("Rebuild index", value=False)
+        current_workspace = _get_workspace(repo_path)
+        workspace_source_url = _display_source_url(repo_path, current_workspace)
 
         if repo_ready:
-            st.caption(f"Repository found: {repo_path}")
+            if repo_spec["kind"] == "github_url" and not repo_path.exists():
+                st.caption(f"GitHub repository will be cloned to: {repo_path}")
+            else:
+                st.caption(f"Repository found: {repo_path}")
+            if workspace_source_url:
+                st.caption(f"Imported from GitHub URL: {workspace_source_url}")
         else:
             st.error(repo_status_message)
         st.caption(f"Index directory: {index_dir}")
@@ -136,9 +148,12 @@ def main() -> None:
             if st.button("Build / Load Index", use_container_width=True, type="primary", disabled=not repo_ready):
                 try:
                     with st.spinner("Preparing index..."):
+                        repo_path = _prepare_repo_for_indexing(repo_input, repo_path, repo_spec)
                         index = build_or_load_index(repo_path=repo_path, config=config, rebuild=rebuild)
-                    _save_workspace(repo_path=repo_path, index=index)
+                    _save_workspace(repo_path=repo_path, index=index, source_url=_workspace_source_url(repo_spec))
+                    _queue_repo_input_value(str(repo_path))
                     st.success(f"Index ready at: {config.resolve_index_dir(repo_path)}")
+                    st.rerun()
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Failed to prepare index: {exc}")
         with action_col2:
@@ -149,7 +164,7 @@ def main() -> None:
                 st.session_state["active_repo_key"] = _repo_key(repo_path)
                 st.rerun()
         with action_col3:
-            if st.button("Save workspace", use_container_width=True, disabled=not repo_ready):
+            if st.button("Save workspace", use_container_width=True, disabled=not repo_ready or not repo_path.exists()):
                 workspace = _get_workspace(repo_path)
                 st.session_state["workspaces"][_repo_key(repo_path)] = workspace
                 if _repo_key(repo_path) not in st.session_state["workspace_order"]:
@@ -163,6 +178,9 @@ def main() -> None:
         metric_col1.metric("Chat model", config.chat_model)
         metric_col2.metric("Embedding model", config.embedding_model)
         st.caption(f"Active repo: {repo_path.name}")
+        active_source_url = _display_source_url(repo_path, _get_workspace(repo_path))
+        if active_source_url:
+            st.caption(f"GitHub source: {active_source_url}")
         st.caption(f"Saved workspaces: {len(st.session_state['workspace_order'])}")
         current_workspace = _get_workspace(repo_path)
         st.caption(f"Index ready: {'Yes' if current_workspace['index'] is not None else 'No'}")
@@ -245,9 +263,33 @@ def _init_session_state() -> None:
     st.session_state.setdefault("pending_repo_key", "")
     st.session_state.setdefault("question_in_flight", False)
     st.session_state.setdefault("active_question_run_id", 0)
+    st.session_state.setdefault("pending_repo_input_value", "")
+    st.session_state.setdefault("pending_workspace_selector", "")
     if "repo_input_value" not in st.session_state:
         default_repo = str((Path(__file__).resolve().parents[2] / "github-efficiency-analyzer").resolve())
         st.session_state["repo_input_value"] = st.session_state["active_repo_key"] or default_repo
+
+
+def _queue_repo_input_value(value: str) -> None:
+    st.session_state["pending_repo_input_value"] = value
+
+
+def _queue_workspace_selector(value: str) -> None:
+    st.session_state["pending_workspace_selector"] = value
+
+
+def _apply_pending_repo_input_value() -> None:
+    pending_value = st.session_state.get("pending_repo_input_value", "")
+    if pending_value:
+        st.session_state["repo_input_value"] = pending_value
+        st.session_state["pending_repo_input_value"] = ""
+
+
+def _apply_pending_workspace_selector() -> None:
+    pending_value = st.session_state.get("pending_workspace_selector", "")
+    if pending_value:
+        st.session_state["workspace_selector"] = pending_value
+        st.session_state["pending_workspace_selector"] = ""
 
 
 def _render_messages(messages: list[dict[str, object]]) -> None:
@@ -766,21 +808,54 @@ def _get_workspace(repo_path: Path) -> dict[str, object]:
             "repo_path": repo_key,
             "index": None,
             "messages": [],
+            "source_url": "",
         }
         st.session_state["workspaces"][repo_key] = workspace
         if repo_key not in st.session_state["workspace_order"]:
             st.session_state["workspace_order"].append(repo_key)
+    workspace.setdefault("source_url", "")
     return workspace
 
 
-def _save_workspace(repo_path: Path, index: object) -> None:
+def _save_workspace(repo_path: Path, index: object, source_url: str = "") -> None:
     workspace = _get_workspace(repo_path)
     workspace["index"] = index
     workspace["repo_path"] = _repo_key(repo_path)
+    if source_url:
+        workspace["source_url"] = source_url
     st.session_state["workspaces"][_repo_key(repo_path)] = workspace
     if _repo_key(repo_path) not in st.session_state["workspace_order"]:
         st.session_state["workspace_order"].append(_repo_key(repo_path))
     st.session_state["active_repo_key"] = _repo_key(repo_path)
+    _queue_workspace_selector(_repo_key(repo_path))
+
+
+def _workspace_source_url(repo_spec: dict[str, str]) -> str:
+    if repo_spec.get("kind") == "github_url":
+        return str(repo_spec.get("input", "")).strip()
+    return ""
+
+
+def _display_source_url(repo_path: Path, workspace: dict[str, object]) -> str:
+    stored = str(workspace.get("source_url", "")).strip()
+    if stored:
+        return stored
+    return _infer_github_source_url(repo_path)
+
+
+def _infer_github_source_url(repo_path: Path) -> str:
+    try:
+        relative = repo_path.resolve().relative_to(CLONED_REPOS_ROOT.resolve())
+    except ValueError:
+        return ""
+
+    parts = relative.parts
+    if len(parts) < 2:
+        return ""
+    owner, repo = parts[0], parts[1]
+    if not owner or not repo:
+        return ""
+    return f"https://github.com/{owner}/{repo}"
 
 
 def _question_busy_for_repo(repo_path: Path) -> bool:
@@ -929,7 +1004,7 @@ def _handle_workspace_change() -> None:
     selected_workspace = st.session_state.get("workspace_selector", "")
     if selected_workspace:
         st.session_state["active_repo_key"] = selected_workspace
-        st.session_state["repo_input_value"] = selected_workspace
+        _queue_repo_input_value(selected_workspace)
 
 
 def _validate_repo_path(repo_path: Path) -> tuple[bool, str]:
@@ -938,6 +1013,119 @@ def _validate_repo_path(repo_path: Path) -> tuple[bool, str]:
     if not repo_path.is_dir():
         return False, "Repository path must point to a folder."
     return True, ""
+
+
+def _validate_repo_input(repo_input: str, repo_path: Path, repo_spec: dict[str, str]) -> tuple[bool, str]:
+    cleaned_input = repo_input.strip()
+    if not cleaned_input:
+        return False, "Enter a local repository path or a GitHub repository URL."
+    if repo_spec["kind"] == "github_url":
+        return True, ""
+    return _validate_repo_path(repo_path)
+
+
+def _resolve_repo_input(repo_input: str) -> tuple[Path, dict[str, str]]:
+    cleaned_input = repo_input.strip()
+    github_spec = _parse_github_repo_url(cleaned_input)
+    if github_spec:
+        return _clone_target_dir(github_spec["owner"], github_spec["repo"]), github_spec
+    if cleaned_input:
+        return Path(cleaned_input).resolve(), {"kind": "local_path", "input": cleaned_input}
+    return Path(".").resolve(), {"kind": "local_path", "input": ""}
+
+
+def _parse_github_repo_url(repo_input: str) -> dict[str, str] | None:
+    if not repo_input:
+        return None
+    parsed = urlparse(repo_input)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "github.com":
+        return None
+    path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(path_parts) < 2:
+        return None
+    owner = path_parts[0]
+    repo = path_parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if not owner or not repo:
+        return None
+    return {
+        "kind": "github_url",
+        "input": repo_input,
+        "owner": owner,
+        "repo": repo,
+        "clone_url": f"https://github.com/{owner}/{repo}.git",
+    }
+
+
+def _clone_target_dir(owner: str, repo: str) -> Path:
+    return (CLONED_REPOS_ROOT / owner / repo).resolve()
+
+
+def _prepare_repo_for_indexing(repo_input: str, repo_path: Path, repo_spec: dict[str, str]) -> Path:
+    if repo_spec["kind"] != "github_url":
+        return repo_path
+
+    clone_url = repo_spec["clone_url"]
+    repo_path.parent.mkdir(parents=True, exist_ok=True)
+    if (repo_path / ".git").exists():
+        _run_git_command(["git", "-C", str(repo_path), "pull", "--ff-only"], repo_input)
+    elif repo_path.exists() and any(repo_path.iterdir()):
+        raise RuntimeError(f"Clone target already exists and is not an empty git repository: {repo_path}")
+    else:
+        _run_git_command(["git", "clone", clone_url, str(repo_path)], repo_input)
+
+    valid, message = _validate_repo_path(repo_path)
+    if not valid:
+        raise RuntimeError(message)
+    return repo_path
+
+
+def _run_git_command(command: list[str], repo_input: str) -> None:
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("Git is not installed or is not available on PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        detail = stderr or stdout or f"git command failed for {repo_input}"
+        raise RuntimeError(_humanize_git_error(detail, repo_input)) from exc
+
+
+def _humanize_git_error(detail: str, repo_input: str) -> str:
+    lowered = detail.lower()
+    if any(
+        token in lowered
+        for token in (
+            "timed out",
+            "failed to connect to github.com",
+            "could not resolve host: github.com",
+            "proxy connect aborted",
+            "ssl connect error",
+            "connection was reset",
+            "connection reset",
+        )
+    ):
+        return (
+            "GitHub network request timed out while preparing this repository. "
+            "Check whether this machine can access github.com, verify proxy or VPN settings, "
+            "or clone the repo locally first and then paste the local folder path. "
+            f"Original git detail: {detail}"
+        )
+    if "repository not found" in lowered or "not found" in lowered:
+        return (
+            "GitHub could not find that repository or this machine does not have permission to access it. "
+            "Double-check the URL and repository visibility. "
+            f"Original git detail: {detail}"
+        )
+    if "authentication failed" in lowered:
+        return (
+            "GitHub rejected the request during authentication. "
+            "If the repository is private, authenticate Git on this machine first or use a local clone. "
+            f"Original git detail: {detail}"
+        )
+    return detail
 
 
 if __name__ == "__main__":

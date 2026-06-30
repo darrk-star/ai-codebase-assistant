@@ -695,6 +695,30 @@ def test_build_call_chain_summary_filters_row_builder_functions(tmp_path: Path) 
     assert "build_pr_rows()" not in summary
 
 
+def test_build_call_chain_summary_keeps_explicit_summarize_targets(tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text(
+        "from app.metrics import summarize_workflow_runs\n\n"
+        "def run() -> None:\n"
+        "    workflow_records = []\n"
+        "    summarize_workflow_runs(workflow_records)\n",
+        encoding="utf-8",
+    )
+    (app_dir / "metrics.py").write_text(
+        "def summarize_workflow_runs(records):\n"
+        "    return records\n",
+        encoding="utf-8",
+    )
+
+    summary = qa._build_call_chain_summary(
+        repo_path=tmp_path,
+        search_text="What calls summarize_workflow_runs across files?",
+    )
+
+    assert "`app/main.py` -> `summarize_workflow_runs()` -> `app/metrics.py`" in summary
+
+
 def test_filter_sources_for_flow_question_removes_readme_noise() -> None:
     filtered = qa._filter_sources_for_question(
         source_paths=[

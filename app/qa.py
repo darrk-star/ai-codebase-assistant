@@ -94,10 +94,7 @@ LOW_SIGNAL_FUNCTIONS = {
     "load_dotenv",
 }
 
-LOW_SIGNAL_PREFIXES = (
-    "fetch_",
-    "summarize_",
-)
+LOW_SIGNAL_PREFIXES = ("fetch_",)
 
 LOW_SIGNAL_PATTERNS = (
     "build_pr_rows",
@@ -1561,7 +1558,6 @@ def _build_static_relationship_graph(repo_path: Path) -> dict[str, dict[str, lis
             for call in calls
             if call not in {"def", "if", "for", "while", "return", "print"}
             and call.lower() not in LOW_SIGNAL_FUNCTIONS
-            and not any(call.lower().startswith(prefix) for prefix in LOW_SIGNAL_PREFIXES)
             and call.lower() not in LOW_SIGNAL_PATTERNS
         ]
         function_calls_by_file[relative_path] = list(dict.fromkeys(local_calls))

@@ -30,6 +30,7 @@ def test_submit_suggested_question_without_index_adds_guard_message(monkeypatch,
         "repo_path": repo_key,
         "index": None,
         "messages": [],
+        "source_url": "",
     }
 
     st.session_state.clear()
@@ -69,6 +70,7 @@ def test_submit_suggested_question_stores_call_chain_summary(monkeypatch, tmp_pa
         "repo_path": repo_key,
         "index": "fake-index",
         "messages": [{"role": "user", "content": "Which file calls compute_digest and where is it defined?"}],
+        "source_url": "",
     }
 
     st.session_state.clear()
@@ -124,6 +126,7 @@ def test_submit_suggested_question_accepts_result_without_call_chain_summary(mon
         "repo_path": repo_key,
         "index": "fake-index",
         "messages": [{"role": "user", "content": "Which file contains argparse and the main function?"}],
+        "source_url": "",
     }
 
     st.session_state.clear()
@@ -205,6 +208,195 @@ def test_suggested_questions_cover_multiple_question_types() -> None:
     assert "Which configuration values are defined in this project?" in prompts
     assert "What calls summarize_workflow_runs across files?" in prompts
     assert "What design risks do you see in this project?" in prompts
+
+
+def test_parse_github_repo_url_extracts_owner_and_repo() -> None:
+    parsed = ui._parse_github_repo_url("https://github.com/openai/codex.git")
+
+    assert parsed is not None
+    assert parsed["kind"] == "github_url"
+    assert parsed["owner"] == "openai"
+    assert parsed["repo"] == "codex"
+
+
+def test_resolve_repo_input_maps_github_url_to_clone_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ui, "CLONED_REPOS_ROOT", tmp_path / ".repos")
+
+    repo_path, repo_spec = ui._resolve_repo_input("https://github.com/openai/codex")
+
+    assert repo_spec["kind"] == "github_url"
+    assert repo_path == (tmp_path / ".repos" / "openai" / "codex").resolve()
+
+
+def test_validate_repo_input_accepts_github_url_before_clone(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ui, "CLONED_REPOS_ROOT", tmp_path / ".repos")
+    repo_path, repo_spec = ui._resolve_repo_input("https://github.com/openai/codex")
+
+    valid, message = ui._validate_repo_input("https://github.com/openai/codex", repo_path, repo_spec)
+
+    assert valid is True
+    assert message == ""
+
+
+def test_apply_pending_repo_input_value_updates_widget_state() -> None:
+    st.session_state.clear()
+    st.session_state["pending_repo_input_value"] = "C:/repos/demo"
+    st.session_state["repo_input_value"] = "old"
+
+    ui._apply_pending_repo_input_value()
+
+    assert st.session_state["repo_input_value"] == "C:/repos/demo"
+    assert st.session_state["pending_repo_input_value"] == ""
+
+
+def test_apply_pending_workspace_selector_updates_widget_state() -> None:
+    st.session_state.clear()
+    st.session_state["pending_workspace_selector"] = "C:/repos/demo"
+    st.session_state["workspace_selector"] = "old"
+
+    ui._apply_pending_workspace_selector()
+
+    assert st.session_state["workspace_selector"] == "C:/repos/demo"
+    assert st.session_state["pending_workspace_selector"] == ""
+
+
+def test_save_workspace_queues_workspace_selector(tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+
+    st.session_state.clear()
+    st.session_state["workspaces"] = {}
+    st.session_state["workspace_order"] = []
+    st.session_state["active_repo_key"] = ""
+    st.session_state["pending_workspace_selector"] = ""
+
+    ui._save_workspace(repo_path=repo_path, index="fake-index")
+
+    repo_key = str(repo_path.resolve())
+    assert st.session_state["active_repo_key"] == repo_key
+    assert st.session_state["pending_workspace_selector"] == repo_key
+    assert repo_key in st.session_state["workspace_order"]
+
+
+def test_save_workspace_persists_github_source_url(tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+
+    st.session_state.clear()
+    st.session_state["workspaces"] = {}
+    st.session_state["workspace_order"] = []
+    st.session_state["active_repo_key"] = ""
+    st.session_state["pending_workspace_selector"] = ""
+
+    ui._save_workspace(
+        repo_path=repo_path,
+        index="fake-index",
+        source_url="https://github.com/openai/codex",
+    )
+
+    repo_key = str(repo_path.resolve())
+    assert st.session_state["workspaces"][repo_key]["source_url"] == "https://github.com/openai/codex"
+
+
+def test_workspace_source_url_returns_github_input_for_github_repo() -> None:
+    source_url = ui._workspace_source_url(
+        {
+            "kind": "github_url",
+            "input": "https://github.com/openai/codex",
+            "owner": "openai",
+            "repo": "codex",
+        }
+    )
+
+    assert source_url == "https://github.com/openai/codex"
+
+
+def test_workspace_source_url_ignores_local_path_repo() -> None:
+    source_url = ui._workspace_source_url({"kind": "local_path", "input": "C:/repos/codex"})
+
+    assert source_url == ""
+
+
+def test_infer_github_source_url_from_cloned_repo_path(monkeypatch, tmp_path: Path) -> None:
+    cloned_root = tmp_path / ".repos"
+    repo_path = cloned_root / "obra" / "superpowers"
+    repo_path.mkdir(parents=True)
+    monkeypatch.setattr(ui, "CLONED_REPOS_ROOT", cloned_root)
+
+    source_url = ui._infer_github_source_url(repo_path)
+
+    assert source_url == "https://github.com/obra/superpowers"
+
+
+def test_infer_github_source_url_returns_empty_for_non_clone_path(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ui, "CLONED_REPOS_ROOT", tmp_path / ".repos")
+    repo_path = tmp_path / "local-repo"
+    repo_path.mkdir()
+
+    source_url = ui._infer_github_source_url(repo_path)
+
+    assert source_url == ""
+
+
+def test_display_source_url_prefers_stored_value(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ui, "CLONED_REPOS_ROOT", tmp_path / ".repos")
+    repo_path = tmp_path / ".repos" / "obra" / "superpowers"
+    repo_path.mkdir(parents=True)
+
+    source_url = ui._display_source_url(repo_path, {"source_url": "https://github.com/custom/url"})
+
+    assert source_url == "https://github.com/custom/url"
+
+
+def test_display_source_url_falls_back_to_inferred_clone_url(monkeypatch, tmp_path: Path) -> None:
+    cloned_root = tmp_path / ".repos"
+    repo_path = cloned_root / "obra" / "superpowers"
+    repo_path.mkdir(parents=True)
+    monkeypatch.setattr(ui, "CLONED_REPOS_ROOT", cloned_root)
+
+    source_url = ui._display_source_url(repo_path, {"source_url": ""})
+
+    assert source_url == "https://github.com/obra/superpowers"
+
+
+def test_prepare_repo_for_indexing_clones_github_repo(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ui, "CLONED_REPOS_ROOT", tmp_path / ".repos")
+    repo_path, repo_spec = ui._resolve_repo_input("https://github.com/openai/codex")
+    captured: dict[str, object] = {}
+
+    def fake_run_git_command(command: list[str], repo_input: str) -> None:
+        captured["command"] = command
+        captured["repo_input"] = repo_input
+        repo_path.mkdir(parents=True, exist_ok=True)
+        (repo_path / ".git").mkdir()
+
+    monkeypatch.setattr(ui, "_run_git_command", fake_run_git_command)
+
+    resolved = ui._prepare_repo_for_indexing("https://github.com/openai/codex", repo_path, repo_spec)
+
+    assert resolved == repo_path
+    assert captured["command"] == ["git", "clone", "https://github.com/openai/codex.git", str(repo_path)]
+
+
+def test_humanize_git_error_explains_timeout() -> None:
+    message = ui._humanize_git_error(
+        "fatal: unable to access 'https://github.com/openai/codex.git/': Failed to connect to github.com port 443 after 21090 ms: Timed out",
+        "https://github.com/openai/codex",
+    )
+
+    assert "GitHub network request timed out" in message
+    assert "clone the repo locally first" in message
+    assert "Original git detail:" in message
+
+
+def test_humanize_git_error_explains_missing_repo() -> None:
+    message = ui._humanize_git_error(
+        "remote: Repository not found.",
+        "https://github.com/openai/missing-repo",
+    )
+
+    assert "could not find that repository" in message
+    assert "Double-check the URL" in message
 
 
 def test_suggested_questions_for_repo_uses_detected_repo_signals(tmp_path: Path) -> None:
@@ -416,7 +608,7 @@ def test_queue_question_stores_pending_prompt_and_user_message(monkeypatch, tmp_
     rerun_called = {"value": False}
 
     st.session_state.clear()
-    st.session_state["workspaces"] = {repo_key: {"repo_path": repo_key, "index": "fake-index", "messages": []}}
+    st.session_state["workspaces"] = {repo_key: {"repo_path": repo_key, "index": "fake-index", "messages": [], "source_url": ""}}
     st.session_state["workspace_order"] = [repo_key]
     st.session_state["active_repo_key"] = repo_key
     st.session_state["pending_question"] = ""
@@ -447,6 +639,7 @@ def test_process_pending_question_consumes_matching_prompt(monkeypatch, tmp_path
         "repo_path": repo_key,
         "index": "fake-index",
         "messages": [{"role": "user", "content": "Where is the Ollama base URL configured?"}],
+        "source_url": "",
     }
     captured: dict[str, object] = {}
 
@@ -496,6 +689,7 @@ def test_process_pending_question_ignores_other_workspace(tmp_path: Path) -> Non
         "repo_path": repo_key,
         "index": "fake-index",
         "messages": [],
+        "source_url": "",
     }
 
     st.session_state.clear()
@@ -564,6 +758,7 @@ def test_submit_suggested_question_drops_late_answer_after_cancel(monkeypatch, t
         "repo_path": repo_key,
         "index": "fake-index",
         "messages": [{"role": "user", "content": "Where is the Ollama base URL configured?"}],
+        "source_url": "",
     }
 
     st.session_state.clear()
