@@ -6,6 +6,7 @@ import pytest
 
 from app.config import AppConfig
 from app import qa
+from app import qa_types
 
 
 class FakeNode:
@@ -15,6 +16,21 @@ class FakeNode:
             "extension": extension,
         }
         self.text = text
+
+
+class FakeIndex:
+    def __init__(self, nodes: list[FakeNode]) -> None:
+        self._nodes = nodes
+
+    def as_retriever(self, similarity_top_k: int = 8):
+        class FakeRetriever:
+            def __init__(self, nodes: list[FakeNode]) -> None:
+                self._nodes = nodes
+
+            def retrieve(self, search_question: str) -> list[FakeNode]:
+                return self._nodes
+
+        return FakeRetriever(self._nodes)
 
 
 def test_answer_question_requires_index(tmp_path: Path) -> None:
@@ -216,6 +232,21 @@ def test_finalize_answer_formats_composite_entity_location_question() -> None:
     assert "`app/metrics.py`" in result
     assert "`app/main.py` calls the workflow-fetching logic" in result
     assert "The most relevant location for this question is" not in result
+
+
+def test_finalize_answer_entrypoint_question_reports_missing_python_style_entrypoint() -> None:
+    result = qa._finalize_answer(
+        answer_text="generic",
+        source_paths=[],
+        evidence_blocks=[],
+        question="Which file contains argparse and the main function?",
+        call_chain_summary="",
+    )
+
+    assert "could not find a Python-style `argparse` plus `main()` entrypoint" in result
+    assert "skills/" in result
+    assert "index.ts" in result
+    assert "The most relevant location for this question is `the retrieved repository context`." not in result
 
 
 def test_finalize_answer_infers_report_writer_for_composite_entity_location_question() -> None:
@@ -486,6 +517,8 @@ def test_keyword_patterns_for_open_analysis_include_high_signal_terms() -> None:
     assert "category_counts" in patterns
     assert "workflow_failures" in patterns
     assert "unknown_failure" in patterns
+    assert "export function" in patterns
+    assert "throw new" in patterns
 
 
 def test_collect_keyword_contexts_finds_call_chain_files(tmp_path: Path) -> None:
@@ -876,6 +909,71 @@ def test_filter_entity_location_for_argparse_prefers_main_over_config() -> None:
     assert [item["file_path"] for item in evidence] == ["app/main.py"]
 
 
+def test_filter_entity_location_for_entrypoint_excludes_skills_and_docs_markdown() -> None:
+    source_paths = qa._filter_sources_for_question(
+        source_paths=[
+            "skills/writing-plans/SKILL.md",
+            "docs/plans/2026-01-17-visual-brainstorming.md",
+            "src/agent.ts",
+            "README.md",
+        ],
+        question="Which file contains argparse and the main function?",
+        call_chain_summary="",
+    )
+    evidence = qa._filter_evidence_for_question(
+        evidence_blocks=[
+            {
+                "file_path": "skills/writing-plans/SKILL.md",
+                "reason": "Identifier definition match",
+                "snippet": "main function guidance for planning",
+            },
+            {
+                "file_path": "docs/plans/2026-01-17-visual-brainstorming.md",
+                "reason": "Identifier call-site match",
+                "snippet": "cli planning notes",
+            },
+            {
+                "file_path": "src/agent.ts",
+                "reason": "Identifier call-site match",
+                "snippet": "export function runAgent() {\n  process.argv.slice(2)\n}",
+            },
+        ],
+        question="Which file contains argparse and the main function?",
+    )
+
+    assert source_paths == ["src/agent.ts"]
+    assert [item["file_path"] for item in evidence] == ["src/agent.ts"]
+
+
+def test_filter_entity_location_for_entrypoint_does_not_fall_back_to_markdown_when_no_code_matches() -> None:
+    source_paths = qa._filter_sources_for_question(
+        source_paths=[
+            "skills/writing-plans/SKILL.md",
+            "docs/plans/2026-01-17-visual-brainstorming.md",
+        ],
+        question="Which file contains argparse and the main function?",
+        call_chain_summary="",
+    )
+    evidence = qa._filter_evidence_for_question(
+        evidence_blocks=[
+            {
+                "file_path": "skills/writing-plans/SKILL.md",
+                "reason": "Identifier definition match",
+                "snippet": "main function guidance for planning",
+            },
+            {
+                "file_path": "docs/plans/2026-01-17-visual-brainstorming.md",
+                "reason": "Identifier call-site match",
+                "snippet": "cli planning notes",
+            },
+        ],
+        question="Which file contains argparse and the main function?",
+    )
+
+    assert source_paths == []
+    assert evidence == []
+
+
 def test_filter_entity_location_for_fetch_and_summary_keeps_all_implementation_files() -> None:
     source_paths = qa._filter_sources_for_question(
         source_paths=[
@@ -976,6 +1074,35 @@ def test_filter_evidence_for_open_analysis_prioritizes_analysis_files_over_clien
     ]
 
 
+def test_filter_evidence_for_open_analysis_drops_repo_metadata_noise() -> None:
+    filtered = qa._filter_evidence_for_question(
+        evidence_blocks=[
+            {"file_path": ".claude-plugin/plugin.json", "reason": "Vector retrieval result", "snippet": "{\"name\": \"superpowers\"}"},
+            {"file_path": ".github/FUNDING.yml", "reason": "Vector retrieval result", "snippet": "github: obra"},
+            {"file_path": ".github/ISSUE_TEMPLATE/feature_request.md", "reason": "Vector retrieval result", "snippet": "Describe the problem"},
+            {"file_path": "src/agent.ts", "reason": "Vector retrieval result", "snippet": "export function runAgent() {\n  if (!workspace) throw new Error('missing workspace')\n}"},
+        ],
+        question="What design risks do you see in this project?",
+    )
+
+    assert [item["file_path"] for item in filtered] == ["src/agent.ts"]
+
+
+def test_filter_sources_for_open_analysis_keeps_code_files_for_non_python_repo() -> None:
+    filtered = qa._filter_sources_for_question(
+        source_paths=[
+            ".claude-plugin/plugin.json",
+            ".github/FUNDING.yml",
+            ".github/ISSUE_TEMPLATE/feature_request.md",
+            "src/agent.ts",
+        ],
+        question="What design risks do you see in this project?",
+        call_chain_summary="",
+    )
+
+    assert filtered == ["src/agent.ts"]
+
+
 def test_build_open_analysis_why_lines_prefers_implementation_signals() -> None:
     why_lines = qa._build_open_analysis_why_lines(
         [
@@ -994,6 +1121,63 @@ def test_build_open_analysis_why_lines_prefers_implementation_signals() -> None:
 
     assert "hard-codes failure classification rules" in why_lines[0]
     assert "aggregates workflow signals through in-memory counters" in why_lines[1]
+
+
+def test_build_open_analysis_why_lines_supports_typescript_signals() -> None:
+    why_lines = qa._build_open_analysis_why_lines(
+        [
+            {
+                "file_path": "src/agent.ts",
+                "reason": "Vector retrieval result",
+                "snippet": (
+                    "export interface AgentContext { workspace: string }\n"
+                    "export async function runAgent(ctx: AgentContext) {\n"
+                    "  if (!ctx.workspace) throw new Error('missing workspace')\n"
+                    "}"
+                ),
+            },
+        ]
+    )
+
+    assert "exports `runAgent()`" in why_lines[0] or "centralizes the `AgentContext` interface" in why_lines[0]
+
+
+def test_finalize_answer_open_analysis_reports_insufficient_implementation_evidence() -> None:
+    result = qa._finalize_answer(
+        answer_text="The project may have several design risks.",
+        source_paths=[],
+        evidence_blocks=[],
+        question="What design risks do you see in this project?",
+        call_chain_summary="",
+    )
+
+    assert "could not find enough implementation-level evidence" in result
+    assert "runtime proof" in result
+
+
+def test_filter_evidence_for_open_analysis_keeps_typescript_implementation_with_branching() -> None:
+    filtered = qa._filter_evidence_for_question(
+        evidence_blocks=[
+            {
+                "file_path": "src/agent.ts",
+                "reason": "Vector retrieval result",
+                "snippet": "export async function runAgent() {\n  if (!workspace) throw new Error('missing workspace')\n}",
+            },
+            {
+                "file_path": "src/types.ts",
+                "reason": "Vector retrieval result",
+                "snippet": "export interface AgentContext { workspace: string }",
+            },
+            {
+                "file_path": ".github/FUNDING.yml",
+                "reason": "Vector retrieval result",
+                "snippet": "github: obra",
+            },
+        ],
+        question="What design risks do you see in this project?",
+    )
+
+    assert [item["file_path"] for item in filtered] == ["src/agent.ts", "src/types.ts"]
 
 
 def test_build_relationship_evidence_why_lines_filters_unrelated_calls() -> None:
@@ -1088,6 +1272,18 @@ def test_confidence_score_boosts_focused_entity_location_answers() -> None:
     assert score >= 70
 
 
+def test_risk_note_for_entrypoint_question_without_reliable_match_is_conservative() -> None:
+    risk = qa._risk_note(
+        source_paths=[],
+        evidence_blocks=[],
+        question="Which file contains argparse and the main function?",
+        search_question="Which file contains argparse and the main function?",
+    )
+
+    assert "could not recover a reliable implementation entry file" in risk
+    assert "confirmed file match" in risk
+
+
 def test_confidence_score_boosts_relationship_answers_with_caller_and_definition() -> None:
     score = qa._confidence_score(
         source_paths=["app/main.py", "app/metrics.py"],
@@ -1161,3 +1357,74 @@ def test_risk_note_reflects_question_type() -> None:
     )
 
     assert "interpretation" in risk
+
+
+def test_build_workspace_mismatch_guard_answer_flags_missing_relationship_target(tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+
+    answer = qa_types.build_workspace_mismatch_guard_answer(
+        question="What calls summarize_workflow_runs across files?",
+        repo_path=tmp_path,
+        source_paths=["docs/superpowers/specs/2026-05-06-lift-drill-into-evals-design.md"],
+        evidence_blocks=[
+            {
+                "file_path": "docs/superpowers/specs/2026-05-06-lift-drill-into-evals-design.md",
+                "reason": "Keyword-based code match",
+                "snippet": "evaluation design notes",
+            }
+        ],
+        call_chain_summary="",
+        repo_symbols=qa._repo_symbol_catalog(str(tmp_path.resolve())),
+        extract_identifier_terms=qa._extract_identifier_terms,
+    )
+
+    assert "does not appear to match the current workspace" in answer
+    assert "`summarize_workflow_runs`" in answer
+    assert "Switch to the repository" in answer
+
+
+def test_answer_question_returns_workspace_mismatch_guard_before_model_call(monkeypatch, tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+
+    config = AppConfig(
+        ollama_base_url="http://localhost:11434",
+        chat_model="qwen2.5:7b",
+        embedding_model="nomic-embed-text",
+        index_dir_name=".storage",
+        chunk_size=1200,
+        chunk_overlap=150,
+        top_k=8,
+    )
+    fake_index = FakeIndex(
+        [
+            FakeNode(
+                "docs/superpowers/specs/2026-05-06-lift-drill-into-evals-design.md",
+                "evaluation design notes",
+                extension=".md",
+            )
+        ]
+    )
+
+    monkeypatch.setattr(qa, "_rewrite_question", lambda question, history, llm: question)
+    monkeypatch.setattr(qa, "ChatOllama", lambda **kwargs: object())
+
+    class FailPrompt:
+        def __or__(self, other):
+            raise AssertionError("LLM should not be invoked when workspace mismatch guard triggers")
+
+    monkeypatch.setattr(qa, "ANSWER_PROMPT", FailPrompt())
+
+    result = qa.answer_question(
+        index=fake_index,
+        question="Which file fetches GitHub workflow runs and where are they summarized?",
+        config=config,
+        repo_path=tmp_path,
+    )
+
+    assert "does not appear to match the current workspace" in result.answer
+    assert result.sources == []
+    assert result.confidence_label == "Low confidence"

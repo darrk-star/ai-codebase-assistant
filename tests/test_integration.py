@@ -124,6 +124,20 @@ def test_load_codebase_documents_reads_sample_repo(tmp_path: Path) -> None:
     assert "app/metrics.py" in file_paths
 
 
+def test_load_codebase_documents_includes_typescript_files(tmp_path: Path) -> None:
+    repo_path = tmp_path / "ts_repo"
+    src_dir = repo_path / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "agent.ts").write_text("export function runAgent() { return true }\n", encoding="utf-8")
+    (src_dir / "types.ts").write_text("export interface AgentContext { workspace: string }\n", encoding="utf-8")
+
+    documents = load_codebase_documents(repo_path)
+    file_paths = sorted(doc.metadata["file_path"] for doc in documents)
+
+    assert "src/agent.ts" in file_paths
+    assert "src/types.ts" in file_paths
+
+
 def test_answer_question_uses_sample_repo_context(monkeypatch, tmp_path: Path) -> None:
     repo_path = _make_sample_repo(tmp_path)
     config = _base_config()

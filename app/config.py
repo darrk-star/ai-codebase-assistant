@@ -7,6 +7,10 @@ from pathlib import Path
 
 DEFAULT_EXTENSIONS = (
     ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
     ".md",
     ".txt",
     ".json",
