@@ -114,6 +114,8 @@ OPEN_ANALYSIS_CODE_EXTENSIONS = {
     ".jsx",
     ".ts",
     ".tsx",
+    ".cjs",
+    ".mjs",
     ".go",
     ".rs",
     ".java",
@@ -129,6 +131,7 @@ OPEN_ANALYSIS_CODE_EXTENSIONS = {
     ".swift",
     ".scala",
     ".sh",
+    ".cmd",
 }
 
 
@@ -218,6 +221,8 @@ def answer_question(
         question=question,
         call_chain_summary=call_chain_summary,
     )
+    if classify_question_type(question, call_chain_summary) == "open_analysis":
+        source_paths = _supplement_open_analysis_source_paths(source_paths, repo_path)
     evidence_blocks = _filter_evidence_for_question(
         evidence_blocks=evidence_blocks,
         question=question,
@@ -438,7 +443,10 @@ def _build_typed_answer(
         cleaned = answer_text.strip()
         if not cleaned:
             return ""
-        why_lines = _build_open_analysis_why_lines(evidence_blocks)
+        why_lines = _build_open_analysis_why_lines(
+            evidence_blocks=evidence_blocks,
+            source_paths=source_paths,
+        )
         answer_line = _build_open_analysis_answer_line(why_lines)
         if not why_lines:
             why_lines = [
@@ -666,16 +674,54 @@ def _build_relationship_answer_line(
 
 def _build_open_analysis_why_lines(
     evidence_blocks: list[dict[str, str]],
+    source_paths: list[str] | None = None,
     limit: int = 3,
 ) -> list[str]:
     why_lines: list[str] = []
+    covered_paths: set[str] = set()
     for item in evidence_blocks[:limit]:
         file_path = str(item.get("file_path", "")).strip()
         if not file_path or file_path == "call-chain-summary":
             continue
         snippet = str(item.get("snippet", "")).strip()
         why_lines.append(_describe_open_analysis_evidence(file_path, snippet))
+        covered_paths.add(file_path.replace("\\", "/").lower())
+
+    if source_paths:
+        for path in source_paths:
+            normalized = path.replace("\\", "/").lower()
+            if len(why_lines) >= limit:
+                break
+            if normalized in covered_paths:
+                continue
+            hint = _describe_open_analysis_path_hint(path)
+            if not hint:
+                continue
+            if any(hint == existing for existing in why_lines):
+                continue
+            why_lines.append(hint)
+            covered_paths.add(normalized)
     return why_lines
+
+
+def _describe_open_analysis_path_hint(file_path: str) -> str:
+    normalized = file_path.replace("\\", "/").lower()
+    if "start-server.sh" in normalized or "stop-server.sh" in normalized:
+        return (
+            f"- `{file_path}` splits server startup and shutdown across shell wrappers and the Node runtime, "
+            "so pid-file cleanup and background process handling are spread across multiple entrypoints."
+        )
+    if normalized.endswith("/server.cjs") or normalized.endswith("server.cjs"):
+        return (
+            f"- `{file_path}` concentrates port, token, and websocket session behavior in one server module, "
+            "so reconnect and runtime identity handling accumulate here."
+        )
+    if normalized.endswith("/helper.js") or normalized.endswith("helper.js"):
+        return (
+            f"- `{file_path}` keeps websocket reconnect behavior and browser session storage coupling in one client helper, "
+            "which narrows where recovery bugs can hide."
+        )
+    return ""
 
 
 def _describe_relationship_evidence(
@@ -753,14 +799,25 @@ def _describe_open_analysis_evidence(file_path: str, snippet: str) -> str:
 
     function_match = re.search(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet)
     exported_function_match = re.search(r"export\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet)
-    const_function_match = re.search(r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(", snippet)
+    const_function_match = re.search(
+        r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_][A-Za-z0-9_]*\s*=>)",
+        snippet,
+    )
     interface_match = re.search(r"interface\s+([A-Za-z_][A-Za-z0-9_]*)\b", snippet)
+    module_export_match = re.search(r"module\.exports\s*=\s*\{?\s*([A-Za-z_][A-Za-z0-9_]*)", snippet)
+    snippet_lower = snippet.lower()
     if "patterns:" in snippet or "keywords in" in snippet or "permission_failure" in snippet:
         return f"- `{file_path}` hard-codes failure classification rules in one place, so new failure modes require code changes instead of configuration."
     if "unknown_failure" in snippet or "fallback_detail" in snippet:
         return f"- `{file_path}` falls back to a generic `unknown_failure` path when no rule matches, which suggests edge cases can collapse into a coarse bucket."
     if any(token in snippet for token in ("category_counts", "workflow_failures", "grouped:", "top_failed_workflows")):
         return f"- `{file_path}` aggregates workflow signals through in-memory counters and grouped summaries, concentrating the reporting logic in a small set of data structures."
+    if any(token in snippet_lower for token in ("port_file", "brainstorm_port", "token_file", "brainstorm_token", "cookie_name", "sessionstorage")):
+        return f"- `{file_path}` coordinates session key, port reuse, and reconnect/auth state in one runtime module, so browser recovery and server identity are coupled here."
+    if any(token in snippet_lower for token in ("server.pid", "pid_file", "nohup", "node server.cjs", "spawn(", "child_process", "kill \"$old_pid\"", "kill $old_pid", "brainstorm_owner_pid")):
+        return f"- `{file_path}` coordinates startup and shutdown across shell and Node entrypoints using pid-file state and background process management, so lifecycle bugs can span multiple scripts."
+    if any(token in snippet_lower for token in ("server-started", "websocket")):
+        return f"- `{file_path}` coordinates websocket connection state and companion recovery in one runtime module, so reconnect behavior and live session delivery are coupled here."
     if function_match:
         function_name = function_match.group(1)
         return f"- `{file_path}` defines `{function_name}()`, which is one of the implementation points this answer is based on."
@@ -769,7 +826,10 @@ def _describe_open_analysis_evidence(file_path: str, snippet: str) -> str:
         return f"- `{file_path}` exports `{function_name}()`, so this file is one of the public implementation entry points behind the current behavior."
     if const_function_match:
         function_name = const_function_match.group(1)
-        return f"- `{file_path}` defines `{function_name}` as a function value, which makes this file part of the active implementation path rather than repository metadata."
+        return f"- `{file_path}` defines helper logic such as `{function_name}()`, which shows this file contains active runtime behavior rather than repository metadata."
+    if module_export_match:
+        export_name = module_export_match.group(1)
+        return f"- `{file_path}` exposes `{export_name}` through `module.exports`, so downstream behavior depends on this shared implementation surface."
     if interface_match:
         interface_name = interface_match.group(1)
         return f"- `{file_path}` centralizes the `{interface_name}` interface, so data-shape changes can ripple through multiple call sites from here."
@@ -815,21 +875,45 @@ def _build_open_analysis_answer_line(why_lines: list[str]) -> str:
             risk_phrases.append("coarse unknown-failure fallback behavior")
         elif "aggregates workflow signals through in-memory counters" in text:
             risk_phrases.append("concentrated in-memory aggregation logic")
+        elif "coordinates session key, port reuse, and reconnect/auth state" in text:
+            risk_phrases.append("centralized session and server lifecycle handling")
+        elif "coordinates startup and shutdown across shell and Node entrypoints" in text:
+            risk_phrases.append("cross-script process orchestration")
+        elif "splits server startup and shutdown across shell wrappers and the Node runtime" in text:
+            risk_phrases.append("cross-script process orchestration")
+        elif "coordinates websocket connection state and companion recovery" in text:
+            risk_phrases.append("centralized websocket session recovery")
+        elif "keeps websocket reconnect behavior and browser session storage coupling" in text:
+            risk_phrases.append("browser-side session recovery coupling")
         elif "defines `" in text and "implementation points" in text:
             risk_phrases.append("single-function coupling around core analysis paths")
 
     unique_phrases = list(dict.fromkeys(risk_phrases))
     if unique_phrases:
-        top = ", ".join(unique_phrases[:2])
+        phrase_priority = {
+            "hard-coded failure classification rules": 0,
+            "centralized session and server lifecycle handling": 1,
+            "centralized websocket session recovery": 2,
+            "cross-script process orchestration": 3,
+            "concentrated in-memory aggregation logic": 4,
+            "browser-side session recovery coupling": 5,
+            "coarse unknown-failure fallback behavior": 6,
+            "single-function coupling around core analysis paths": 7,
+        }
+        ordered_phrases = sorted(
+            unique_phrases,
+            key=lambda phrase: phrase_priority.get(phrase, 99),
+        )
+        top = ", ".join(ordered_phrases[:2])
         return f"Answer: Based on the retrieved implementation, the main design risks are {top}."
 
-    return "Answer: Based on the retrieved implementation, the current code suggests a few design risks worth reviewing."
+    return "Answer: Based on the retrieved implementation, the code concentrates a few runtime behaviors in narrow implementation paths worth reviewing."
 
 
 def _extract_answer_line(answer_text: str) -> str:
     cleaned = answer_text.strip()
     if not cleaned:
-        return "Answer: Based on the retrieved implementation, the current code suggests a few design risks worth reviewing."
+        return "Answer: Based on the retrieved implementation, the code concentrates a few runtime behaviors in narrow implementation paths worth reviewing."
     first_line = cleaned.splitlines()[0].strip()
     first_line = strip_trailing_why_marker(first_line)
     if first_line.lower().startswith("answer:"):
@@ -1124,6 +1208,54 @@ def _filter_evidence_for_question(
     return filtered or evidence_blocks
 
 
+def _supplement_open_analysis_source_paths(
+    source_paths: list[str],
+    repo_path: Path,
+    limit: int = 4,
+) -> list[str]:
+    deduped = list(dict.fromkeys(source_paths))
+    if len(deduped) >= limit:
+        return deduped[:limit]
+
+    supplemented = list(deduped)
+    parent_dirs: list[Path] = []
+    for path in deduped:
+        normalized = path.replace("\\", "/")
+        candidate = (repo_path / normalized).resolve()
+        if not candidate.exists():
+            continue
+        if "/scripts/" not in normalized.lower() and candidate.suffix.lower() not in {".js", ".cjs", ".mjs", ".sh", ".cmd"}:
+            continue
+        parent = candidate.parent
+        if parent not in parent_dirs:
+            parent_dirs.append(parent)
+
+    sibling_paths: list[str] = []
+    for parent in parent_dirs:
+        try:
+            for child in parent.iterdir():
+                if not child.is_file():
+                    continue
+                relative = child.relative_to(repo_path).as_posix()
+                if not _is_open_analysis_implementation_path(relative):
+                    continue
+                sibling_paths.append(relative)
+        except OSError:
+            continue
+
+    ranked_siblings = sorted(
+        dict.fromkeys(sibling_paths),
+        key=lambda path: (_open_analysis_path_rank(path), path.replace("\\", "/").lower()),
+    )
+    for path in ranked_siblings:
+        if len(supplemented) >= limit:
+            break
+        if path not in supplemented:
+            supplemented.append(path)
+
+    return supplemented[:limit]
+
+
 def _prioritize_entity_location_paths(paths: list[str], question: str, limit: int = 2) -> list[str]:
     if is_fetch_summary_location_query(question):
         return _prioritize_fetch_summary_paths(paths) or list(dict.fromkeys(paths))[:4]
@@ -1384,6 +1516,8 @@ def _open_analysis_evidence_score(item: dict[str, str]) -> int:
         score += 8
     if re.search(r"\bconst\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:async\s*)?\(", snippet):
         score += 6
+    if "module.exports" in snippet_lower:
+        score += 6
     if re.search(r"\bclass\s+[A-Za-z_][A-Za-z0-9_]*\b", snippet):
         score += 6
     if re.search(r"\binterface\s+[A-Za-z_][A-Za-z0-9_]*\b", snippet):
@@ -1392,6 +1526,8 @@ def _open_analysis_evidence_score(item: dict[str, str]) -> int:
         score += 4
     if any(token in snippet_lower for token in ("dict[", "list[", "set[", "defaultdict", "counter(", "cache", "state", "map<", "record<", "readonly ", "interface ")):
         score += 3
+    if any(token in snippet_lower for token in ("server-started", "websocket", "sessionstorage", "server.pid", "brainstorm_port", "brainstorm_token", "child_process", "spawn(", "exec(")):
+        score += 8
     if any(
         token in snippet_lower
         for token in (
@@ -1408,6 +1544,13 @@ def _open_analysis_evidence_score(item: dict[str, str]) -> int:
             "workspace",
             "repository",
             "timeout",
+            "server",
+            "session",
+            "port",
+            "token",
+            "auth",
+            "plugin",
+            "hook",
         )
     ):
         score += 8
@@ -1454,16 +1597,17 @@ def _prioritize_open_analysis_evidence(
         and _open_analysis_evidence_score(item) > 0
     ]
     if strongest_priority:
-        if len(strongest_priority) >= 2:
-            return strongest_priority[:4]
+        diversified = _diversify_open_analysis_evidence(strongest_priority, limit=4)
+        if len(diversified) >= 2:
+            return diversified
         supplemental = [
             item
             for item in ranked
-            if item not in strongest_priority
+            if item not in diversified
             and _is_open_analysis_implementation_path(str(item.get("file_path", "")))
             and _open_analysis_evidence_score(item) > 0
         ]
-        return (strongest_priority + supplemental)[:4]
+        return _diversify_open_analysis_evidence(diversified + supplemental, limit=4)
     high_priority = [
         item
         for item in ranked
@@ -1471,16 +1615,86 @@ def _prioritize_open_analysis_evidence(
         and _open_analysis_evidence_score(item) > 0
     ]
     if high_priority:
-        return high_priority[:4]
+        return _diversify_open_analysis_evidence(high_priority, limit=4)
     return []
+
+
+def _open_analysis_evidence_tags(item: dict[str, str]) -> set[str]:
+    file_path = str(item.get("file_path", "")).replace("\\", "/").lower()
+    snippet_lower = str(item.get("snippet", "")).lower()
+    tags: set[str] = set()
+
+    if any(token in snippet_lower for token in ("patterns:", "permission_failure", "unknown_failure", "fallback_detail")):
+        tags.add("failure_rules")
+    if any(token in snippet_lower for token in ("category_counts", "workflow_failures", "top_failed_workflows", "grouped:", "failure_categories")):
+        tags.add("aggregation")
+    if any(token in snippet_lower for token in ("port_file", "token_file", "brainstorm_port", "brainstorm_token", "cookie_name", "sessionstorage")):
+        tags.add("session_runtime")
+    if any(token in snippet_lower for token in ("server-started", "websocket")):
+        tags.add("websocket_recovery")
+    if any(token in snippet_lower for token in ("server.pid", "pid_file", "nohup", "node server.cjs", "spawn(", "child_process", "brainstorm_owner_pid")):
+        tags.add("process_orchestration")
+    if any(token in file_path for token in ("start-server", "stop-server", "/scripts/")) and any(
+        token in snippet_lower for token in ("pid_file", "nohup", "node server.cjs", "kill ", "server.log")
+    ):
+        tags.add("process_orchestration")
+    if re.search(r"\binterface\s+[A-Za-z_][A-Za-z0-9_]*\b", str(item.get("snippet", ""))):
+        tags.add("data_contract")
+    if any(token in snippet_lower for token in ("if ", "elif ", "else:", "switch ", "throw new ", "try:", "except ")):
+        tags.add("control_flow")
+    if not tags:
+        tags.add("generic")
+    return tags
+
+
+def _diversify_open_analysis_evidence(
+    evidence_blocks: list[dict[str, str]],
+    limit: int = 4,
+) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    seen_tags: set[str] = set()
+
+    for item in evidence_blocks:
+        if len(selected) >= limit:
+            break
+        tags = _open_analysis_evidence_tags(item)
+        if not selected or not tags.issubset(seen_tags):
+            selected.append(item)
+            seen_tags.update(tags)
+
+    if len(selected) < limit:
+        for item in evidence_blocks:
+            if len(selected) >= limit:
+                break
+            if item not in selected:
+                selected.append(item)
+
+    return selected[:limit]
 
 
 def _open_analysis_path_rank(path: str) -> int:
     normalized = path.replace("\\", "/").lower()
     if _is_open_analysis_noise_path(normalized):
         return 4
-    high_signal_tokens = ("metrics", "analysis", "rules", "scoring", "evaluate", "failure", "agent", "runner", "service", "core")
-    low_signal_tokens = ("github_client", "report", "ui", "main", "cli", "config", "index", "types")
+    high_signal_tokens = (
+        "metrics",
+        "analysis",
+        "rules",
+        "scoring",
+        "evaluate",
+        "failure",
+        "agent",
+        "runner",
+        "service",
+        "core",
+        "server",
+        "helper",
+        "hook",
+        "auth",
+        "launcher",
+        "protocol",
+    )
+    low_signal_tokens = ("github_client", "report", "ui", "main", "cli", "config", "index", "types", "test")
     if any(token in normalized for token in high_signal_tokens):
         return 0
     if any(token in normalized for token in low_signal_tokens):
@@ -2057,6 +2271,17 @@ def _keyword_patterns_for_query(search_text: str) -> tuple[str, ...]:
                 "timeout",
                 "workspace",
                 "repository",
+                "server-started",
+                "websocket",
+                "sessionstorage",
+                "server.pid",
+                "brainstorm_port",
+                "brainstorm_token",
+                "spawn(",
+                "child_process",
+                "auth",
+                "plugin",
+                "hook",
             ]
         )
 
@@ -2083,7 +2308,19 @@ def _preferred_snippet_patterns_for_query(search_text: str) -> tuple[str, ...]:
         "throw new",
         "interface ",
         "switch",
+        "port_file",
+        "token_file",
+        "cookie_name",
+        "pid_file",
+        "node server.cjs",
+        "nohup",
+        "spawn(",
+        "brainstorm_port",
+        "brainstorm_token",
         "workspace",
+        "server-started",
+        "websocket",
+        "module.exports",
     )
 
 
@@ -2278,13 +2515,13 @@ def _risk_note(
     question_lower = question.lower()
     question_type = classify_question_type(question, "")
 
+    if question_type == "entity_location" and _is_entrypoint_query(question) and score < 80:
+        return "The assistant could not recover a reliable implementation entry file for this repository, so this is a conservative best-effort judgment rather than a confirmed file match."
     if score >= 80:
         return "The answer is backed by focused matches and is likely reliable for this repository question."
     if question_type == "open_analysis":
         return "This answer is an evidence-backed codebase interpretation, not a definitive runtime or architectural proof."
     if question_type == "entity_location":
-        if _is_entrypoint_query(question) and not source_paths and not evidence_blocks:
-            return "The assistant could not recover a reliable implementation entry file for this repository, so this is a conservative best-effort judgment rather than a confirmed file match."
         return "This answer points to the strongest matching file location, but you should still open the cited file to confirm surrounding context."
     if question_type == "relationship_trace":
         return "This answer traces likely cross-file relationships from retrieved code, but it may still miss indirect runtime behavior."

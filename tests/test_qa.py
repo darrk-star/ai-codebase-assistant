@@ -519,6 +519,8 @@ def test_keyword_patterns_for_open_analysis_include_high_signal_terms() -> None:
     assert "unknown_failure" in patterns
     assert "export function" in patterns
     assert "throw new" in patterns
+    assert "server-started" in patterns
+    assert "brainstorm_port" in patterns
 
 
 def test_collect_keyword_contexts_finds_call_chain_files(tmp_path: Path) -> None:
@@ -1142,6 +1144,94 @@ def test_build_open_analysis_why_lines_supports_typescript_signals() -> None:
     assert "exports `runAgent()`" in why_lines[0] or "centralizes the `AgentContext` interface" in why_lines[0]
 
 
+def test_build_open_analysis_why_lines_supports_server_session_signals() -> None:
+    why_lines = qa._build_open_analysis_why_lines(
+        [
+            {
+                "file_path": "skills/brainstorming/scripts/helper.js",
+                "reason": "Vector retrieval result",
+                "snippet": (
+                    "let ws = null;\n"
+                    "function websocketUrl() {\n"
+                    "  return 'ws://' + window.location.host;\n"
+                    "}\n"
+                    "window.sessionStorage.getItem('brainstorm-session-key')\n"
+                ),
+            },
+        ]
+    )
+
+    assert "session key" in why_lines[0] or "websocket connection state" in why_lines[0]
+    assert "reconnect/auth state" in why_lines[0] or "companion recovery" in why_lines[0]
+    assert "manages live server/session state" not in why_lines[0]
+
+
+def test_describe_open_analysis_evidence_does_not_misclassify_parenthesized_const_as_function() -> None:
+    line = qa._describe_open_analysis_evidence(
+        "skills/brainstorming/scripts/server.cjs",
+        "const masked = (secondByte & 0x80) !== 0;\nif (!masked) throw new Error('Client frames must be masked');",
+    )
+
+    assert "function value" not in line
+    assert "control-flow branches" in line
+
+
+def test_build_open_analysis_why_lines_describes_server_runtime_coordination() -> None:
+    why_lines = qa._build_open_analysis_why_lines(
+        [
+            {
+                "file_path": "skills/brainstorming/scripts/server.cjs",
+                "reason": "Vector retrieval result",
+                "snippet": (
+                    "const PORT_FILE = process.env.BRAINSTORM_PORT_FILE || null;\n"
+                    "const TOKEN_FILE = process.env.BRAINSTORM_TOKEN_FILE || null;\n"
+                    "let COOKIE_NAME = 'brainstorm-key-' + PORT;\n"
+                ),
+            },
+        ]
+    )
+
+    assert "port reuse" in why_lines[0]
+    assert "session key" in why_lines[0]
+
+
+def test_build_open_analysis_why_lines_describes_cross_script_process_orchestration() -> None:
+    why_lines = qa._build_open_analysis_why_lines(
+        [
+            {
+                "file_path": "skills/brainstorming/scripts/start-server.sh",
+                "reason": "Vector retrieval result",
+                "snippet": (
+                    "PID_FILE=\"${STATE_DIR}/server.pid\"\n"
+                    "kill \"$old_pid\" 2>/dev/null\n"
+                    "nohup env BRAINSTORM_DIR=\"$SESSION_DIR\" node server.cjs > \"$LOG_FILE\" 2>&1 &\n"
+                ),
+            },
+        ]
+    )
+
+    assert "shell and Node entrypoints" in why_lines[0]
+    assert "pid-file" in why_lines[0]
+
+
+def test_filter_sources_for_open_analysis_keeps_plugin_script_files() -> None:
+    filtered = qa._filter_sources_for_question(
+        source_paths=[
+            "skills/brainstorming/scripts/helper.js",
+            "skills/brainstorming/scripts/server.cjs",
+            "docs/testing.md",
+            "README.md",
+        ],
+        question="What design risks do you see in this project?",
+        call_chain_summary="",
+    )
+
+    assert filtered == [
+        "skills/brainstorming/scripts/helper.js",
+        "skills/brainstorming/scripts/server.cjs",
+    ]
+
+
 def test_finalize_answer_open_analysis_reports_insufficient_implementation_evidence() -> None:
     result = qa._finalize_answer(
         answer_text="The project may have several design risks.",
@@ -1221,6 +1311,99 @@ def test_extract_best_snippet_prefers_open_analysis_aggregation_patterns() -> No
 
     assert "category_counts" in snippet
     assert "workflow_failures" in snippet
+
+
+def test_build_open_analysis_answer_line_summarizes_runtime_coordination_risks() -> None:
+    answer = qa._build_open_analysis_answer_line(
+        [
+            "- `skills/brainstorming/scripts/server.cjs` coordinates session key, port reuse, and reconnect/auth state in one runtime module.",
+            "- `skills/brainstorming/scripts/start-server.sh` coordinates startup and shutdown across shell and Node entrypoints using pid-file state and background process management.",
+        ]
+    )
+
+    assert "session and server lifecycle handling" in answer
+    assert "cross-script process orchestration" in answer
+
+
+def test_build_open_analysis_answer_line_avoids_legacy_generic_fallback() -> None:
+    answer = qa._build_open_analysis_answer_line(
+        [
+            "- `skills/brainstorming/scripts/server.cjs` coordinates websocket connection state and companion recovery in one runtime module, so reconnect behavior and live session delivery are coupled here.",
+        ]
+    )
+
+    assert "centralized websocket session recovery" in answer
+    assert "current code suggests a few design risks worth reviewing" not in answer
+
+
+def test_build_open_analysis_answer_line_combines_runtime_and_orchestration_risks() -> None:
+    answer = qa._build_open_analysis_answer_line(
+        [
+            "- `skills/brainstorming/scripts/server.cjs` coordinates websocket connection state and companion recovery in one runtime module, so reconnect behavior and live session delivery are coupled here.",
+            "- `skills/brainstorming/scripts/helper.js` keeps websocket reconnect behavior and browser session storage coupling in one client helper, which narrows where recovery bugs can hide.",
+            "- `skills/brainstorming/scripts/start-server.sh` splits server startup and shutdown across shell wrappers and the Node runtime, so pid-file cleanup and background process handling are spread across multiple entrypoints.",
+        ]
+    )
+
+    assert "centralized websocket session recovery" in answer
+    assert "cross-script process orchestration" in answer
+
+
+def test_prioritize_open_analysis_evidence_prefers_distinct_risk_categories() -> None:
+    prioritized = qa._prioritize_open_analysis_evidence(
+        [
+            {
+                "file_path": "skills/brainstorming/scripts/server.cjs",
+                "reason": "Vector retrieval result",
+                "snippet": "const PORT_FILE = process.env.BRAINSTORM_PORT_FILE || null;\nconst TOKEN_FILE = process.env.BRAINSTORM_TOKEN_FILE || null;\nlet COOKIE_NAME = 'brainstorm-key-' + PORT;\n",
+            },
+            {
+                "file_path": "skills/brainstorming/scripts/helper.js",
+                "reason": "Vector retrieval result",
+                "snippet": "let ws = null;\nfunction websocketUrl() {\n  return 'ws://' + window.location.host;\n}\nwindow.sessionStorage.getItem('brainstorm-session-key')\n",
+            },
+            {
+                "file_path": "skills/brainstorming/scripts/start-server.sh",
+                "reason": "Vector retrieval result",
+                "snippet": "PID_FILE=\"${STATE_DIR}/server.pid\"\nkill \"$old_pid\" 2>/dev/null\nnohup env BRAINSTORM_DIR=\"$SESSION_DIR\" node server.cjs > \"$LOG_FILE\" 2>&1 &\n",
+            },
+        ]
+    )
+
+    prioritized_paths = [item["file_path"] for item in prioritized[:3]]
+    assert "skills/brainstorming/scripts/server.cjs" in prioritized_paths
+    assert "skills/brainstorming/scripts/start-server.sh" in prioritized_paths
+
+
+def test_supplement_open_analysis_source_paths_adds_sibling_scripts_for_script_repo() -> None:
+    repo_path = Path(__file__).resolve().parents[1] / ".repos" / "obra" / "superpowers"
+
+    supplemented = qa._supplement_open_analysis_source_paths(
+        ["skills/brainstorming/scripts/server.cjs"],
+        repo_path=repo_path,
+    )
+
+    assert "skills/brainstorming/scripts/server.cjs" in supplemented
+    assert "skills/brainstorming/scripts/start-server.sh" in supplemented
+
+
+def test_build_open_analysis_why_lines_backfills_distinct_path_hints_when_evidence_is_narrow() -> None:
+    why_lines = qa._build_open_analysis_why_lines(
+        evidence_blocks=[
+            {
+                "file_path": "skills/brainstorming/scripts/server.cjs",
+                "reason": "Vector retrieval result",
+                "snippet": "server-started\nwebsocket\n",
+            },
+        ],
+        source_paths=[
+            "skills/brainstorming/scripts/server.cjs",
+            "skills/brainstorming/scripts/start-server.sh",
+        ],
+    )
+
+    assert any("websocket connection state" in line for line in why_lines)
+    assert any("shell wrappers and the Node runtime" in line for line in why_lines)
 
 
 def test_confidence_score_boosts_focused_flow_answers() -> None:

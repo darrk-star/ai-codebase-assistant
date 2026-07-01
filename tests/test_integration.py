@@ -138,6 +138,20 @@ def test_load_codebase_documents_includes_typescript_files(tmp_path: Path) -> No
     assert "src/types.ts" in file_paths
 
 
+def test_load_codebase_documents_includes_common_script_extensions(tmp_path: Path) -> None:
+    repo_path = tmp_path / "script_repo"
+    scripts_dir = repo_path / "skills" / "brainstorming" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "server.cjs").write_text("module.exports = { startServer }\n", encoding="utf-8")
+    (scripts_dir / "start-server.sh").write_text("#!/usr/bin/env bash\necho started\n", encoding="utf-8")
+
+    documents = load_codebase_documents(repo_path)
+    file_paths = sorted(doc.metadata["file_path"] for doc in documents)
+
+    assert "skills/brainstorming/scripts/server.cjs" in file_paths
+    assert "skills/brainstorming/scripts/start-server.sh" in file_paths
+
+
 def test_answer_question_uses_sample_repo_context(monkeypatch, tmp_path: Path) -> None:
     repo_path = _make_sample_repo(tmp_path)
     config = _base_config()
