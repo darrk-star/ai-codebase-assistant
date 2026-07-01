@@ -8,11 +8,11 @@ Built with LangChain, LlamaIndex, Ollama, and Streamlit, it is designed for repo
 
 ## Highlights
 
-- source-grounded repository Q&A with explicit file citations
-- cross-file relationship tracing for callers, definitions, imports, and output writers
-- artifact-flow explanations for digests, reports, charts, and generated files
-- implementation-backed design analysis with conservative confidence labels
-- Streamlit UI with saved workspaces, evidence panels, and repo-specific suggested prompts
+- local-first codebase Q&A with explicit `Answer`, `Why`, `Sources`, confidence labels, and evidence panels
+- implementation-grounded repository analysis across Python, TypeScript, Node helper files, and common script/runtime files such as `.cjs`, `.mjs`, `.sh`, and `.cmd`
+- cross-file relationship tracing for callers, definitions, imports, output writers, and generated artifact flows
+- open-ended design analysis that prefers real implementation files over `README`, `docs`, and repository metadata
+- stronger support for script-heavy repositories by combining evidence from files such as `server.cjs`, `helper.js`, and `start-server.sh`
 - VS Code one-click startup with the project virtual environment and fixed Streamlit port
 
 ## Overview
