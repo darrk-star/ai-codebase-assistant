@@ -57,6 +57,14 @@ Recent updates focused on making answers easier to verify in real files:
 - aligned suggested prompts with the currently indexed repository instead of stale demo identifiers
 - improved VS Code startup flow with virtual environment support, a fixed Streamlit port, and Ollama checks
 
+Recent open-analysis improvements also made mixed script/runtime repositories easier to inspect:
+
+- added indexing support for additional implementation file types such as `.cjs`, `.mjs`, `.sh`, and `.cmd`
+- reduced noisy matches from `README`, `docs`, issue templates, and repository metadata during open analysis
+- improved implementation-backed design analysis for script-heavy repositories where the main logic lives in Node helpers or shell wrappers
+- improved evidence selection so open-ended questions can combine multiple implementation risk surfaces instead of overfitting to a single file
+- improved script-repo answers so they can cite implementation files such as `server.cjs`, `helper.js`, and `start-server.sh`
+
 ## Supported question styles
 
 ### 1. Entity location
