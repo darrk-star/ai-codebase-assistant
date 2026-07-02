@@ -5,3 +5,5 @@ __pycache__/
 .storage/
 .pytest_cache/
 .repos/
+streamlit-*.out.log
+streamlit-*.err.log
