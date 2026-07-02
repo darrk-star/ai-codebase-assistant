@@ -289,6 +289,15 @@ def test_finalize_answer_formats_relationship_trace_question() -> None:
     assert "`app/service.py` -> `compute_digest()` -> `app/helpers.py`" in result
 
 
+def test_classify_question_type_treats_call_and_definition_question_as_relationship_trace() -> None:
+    question_type = qa_types.classify_question_type(
+        "Which file calls compute_digest and where is it defined?",
+        "",
+    )
+
+    assert question_type == "relationship_trace"
+
+
 def test_finalize_answer_rebuilds_relationship_why_without_generic_model_text() -> None:
     result = qa._finalize_answer(
         answer_text=(
@@ -368,6 +377,65 @@ def test_finalize_answer_formats_open_analysis_question() -> None:
     assert "runtime proof" not in result
     assert "Based on the retrieved implementation" in result
     assert "defines `main()`" in result or "implementation detail" in result
+
+
+def test_finalize_answer_runtime_session_flow_uses_direct_answer_line() -> None:
+    result = qa._finalize_answer(
+        answer_text="Answer: The retrieved implementation points to a repository flow for this artifact, but the full cross-file chain was not recovered exactly.",
+        source_paths=[
+            "skills/brainstorming/scripts/helper.js",
+            "skills/brainstorming/scripts/server.cjs",
+            "skills/brainstorming/scripts/start-server.sh",
+        ],
+        evidence_blocks=[
+            {
+                "file_path": "skills/brainstorming/scripts/helper.js",
+                "reason": "Vector retrieval result",
+                "snippet": "let ws = null;\nfunction websocketUrl() {\n  return 'ws://' + window.location.host;\n}\nwindow.sessionStorage.getItem('brainstorm-session-key')\n",
+            },
+            {
+                "file_path": "skills/brainstorming/scripts/server.cjs",
+                "reason": "Vector retrieval result",
+                "snippet": "const PORT_FILE = process.env.BRAINSTORM_PORT_FILE || null;\nconst TOKEN_FILE = process.env.BRAINSTORM_TOKEN_FILE || null;\nlet COOKIE_NAME = 'brainstorm-key-' + PORT;\n",
+            },
+            {
+                "file_path": "skills/brainstorming/scripts/start-server.sh",
+                "reason": "Vector retrieval result",
+                "snippet": "PID_FILE=\"${STATE_DIR}/server.pid\"\nnohup env BRAINSTORM_DIR=\"$SESSION_DIR\" node server.cjs > \"$LOG_FILE\" 2>&1 &\n",
+            },
+        ],
+        question="How does the websocket session recovery work?",
+        call_chain_summary="",
+    )
+
+    assert "The retrieved implementation points to a repository flow for this artifact" not in result
+    assert "client-side reconnect state in `skills/brainstorming/scripts/helper.js`" in result
+    assert "server-side websocket/session handling in `skills/brainstorming/scripts/server.cjs`" in result
+    assert "restart orchestration in `skills/brainstorming/scripts/start-server.sh`" in result
+
+
+def test_finalize_answer_runtime_session_flow_does_not_overclaim_supplemental_sources() -> None:
+    result = qa._finalize_answer(
+        answer_text="Answer: The retrieved implementation points to a repository flow for this artifact, but the full cross-file chain was not recovered exactly.",
+        source_paths=[
+            "skills/brainstorming/scripts/helper.js",
+            "skills/brainstorming/scripts/server.cjs",
+            "skills/brainstorming/scripts/start-server.sh",
+        ],
+        evidence_blocks=[
+            {
+                "file_path": "skills/brainstorming/scripts/helper.js",
+                "reason": "Vector retrieval result",
+                "snippet": "let ws = null;\nfunction websocketUrl() {\n  return 'ws://' + window.location.host;\n}\nwindow.sessionStorage.getItem('brainstorm-session-key')\n",
+            },
+        ],
+        question="How does the websocket session recovery work?",
+        call_chain_summary="",
+    )
+
+    assert "client-side reconnect state in `skills/brainstorming/scripts/helper.js`" in result
+    assert "server-side websocket/session handling in `skills/brainstorming/scripts/server.cjs`" not in result
+    assert "restart orchestration in `skills/brainstorming/scripts/start-server.sh`" not in result
 
 
 def test_finalize_answer_rebuilds_open_analysis_why_even_if_model_supplies_one() -> None:
@@ -1161,9 +1229,10 @@ def test_build_open_analysis_why_lines_supports_server_session_signals() -> None
         ]
     )
 
-    assert "session key" in why_lines[0] or "websocket connection state" in why_lines[0]
-    assert "reconnect/auth state" in why_lines[0] or "companion recovery" in why_lines[0]
+    assert "websocket connection state" in why_lines[0] or "browser session storage coupling" in why_lines[0]
+    assert "companion recovery" in why_lines[0] or "recovery bugs can hide" in why_lines[0]
     assert "manages live server/session state" not in why_lines[0]
+    assert "port reuse" not in why_lines[0]
 
 
 def test_describe_open_analysis_evidence_does_not_misclassify_parenthesized_const_as_function() -> None:
@@ -1230,6 +1299,90 @@ def test_filter_sources_for_open_analysis_keeps_plugin_script_files() -> None:
         "skills/brainstorming/scripts/helper.js",
         "skills/brainstorming/scripts/server.cjs",
     ]
+
+
+def test_filter_sources_for_runtime_session_flow_drops_plan_docs() -> None:
+    filtered = qa._filter_sources_for_question(
+        source_paths=[
+            "skills/brainstorming/scripts/helper.js",
+            "docs/plans/2026-01-17-visual-brainstorming.md",
+            "docs/superpowers/plans/2026-02-19-visual-brainstorming-refactor.md",
+            "skills/brainstorming/scripts/server.cjs",
+            "skills/brainstorming/scripts/start-server.sh",
+        ],
+        question="How does the websocket session recovery work?",
+        call_chain_summary="",
+    )
+
+    assert filtered == [
+        "skills/brainstorming/scripts/helper.js",
+        "skills/brainstorming/scripts/server.cjs",
+        "skills/brainstorming/scripts/start-server.sh",
+    ]
+
+
+def test_filter_evidence_for_runtime_session_flow_drops_plan_docs() -> None:
+    filtered = qa._filter_evidence_for_question(
+        evidence_blocks=[
+            {
+                "file_path": "skills/brainstorming/scripts/helper.js",
+                "reason": "Vector retrieval result",
+                "snippet": "let ws = null;\nfunction websocketUrl() {\n  return 'ws://' + window.location.host;\n}\nwindow.sessionStorage.getItem('brainstorm-session-key')\n",
+            },
+            {
+                "file_path": "docs/plans/2026-01-17-visual-brainstorming.md",
+                "reason": "Vector retrieval result",
+                "snippet": "Task 2: Create the Helper Library and document reconnect behavior",
+            },
+            {
+                "file_path": "docs/superpowers/plans/2026-02-19-visual-brainstorming-refactor.md",
+                "reason": "Vector retrieval result",
+                "snippet": "Add a WebSocket event test with a choice field and verify recovery",
+            },
+            {
+                "file_path": "skills/brainstorming/scripts/server.cjs",
+                "reason": "Vector retrieval result",
+                "snippet": "const PORT_FILE = process.env.BRAINSTORM_PORT_FILE || null;\nconst TOKEN_FILE = process.env.BRAINSTORM_TOKEN_FILE || null;\n",
+            },
+            {
+                "file_path": "skills/brainstorming/scripts/start-server.sh",
+                "reason": "Vector retrieval result",
+                "snippet": "PID_FILE=\"${STATE_DIR}/server.pid\"\nnohup env BRAINSTORM_DIR=\"$SESSION_DIR\" node server.cjs > \"$LOG_FILE\" 2>&1 &\n",
+            },
+        ],
+        question="How does the websocket session recovery work?",
+    )
+
+    assert [item["file_path"] for item in filtered] == [
+        "skills/brainstorming/scripts/helper.js",
+        "skills/brainstorming/scripts/server.cjs",
+        "skills/brainstorming/scripts/start-server.sh",
+    ]
+
+
+def test_runtime_implementation_question_does_not_trigger_for_generic_client_state() -> None:
+    assert qa._is_runtime_implementation_question("How does client state work in this project?") is False
+    assert qa._is_runtime_implementation_question("How does the websocket session recovery work?") is True
+
+
+def test_build_runtime_flow_answer_line_does_not_overclaim_from_supplemented_source_paths() -> None:
+    answer = qa._build_runtime_flow_answer_line(
+        question="How does the server restart work?",
+        source_paths=[
+            "skills/brainstorming/scripts/helper.js",
+            "skills/brainstorming/scripts/server.cjs",
+            "skills/brainstorming/scripts/start-server.sh",
+        ],
+        evidence_blocks=[
+            {
+                "file_path": "skills/brainstorming/scripts/helper.js",
+                "reason": "Vector retrieval result",
+                "snippet": "window.sessionStorage.getItem('brainstorm-session-key')",
+            }
+        ],
+    )
+
+    assert answer == ""
 
 
 def test_finalize_answer_open_analysis_reports_insufficient_implementation_evidence() -> None:
@@ -1387,6 +1540,19 @@ def test_supplement_open_analysis_source_paths_adds_sibling_scripts_for_script_r
     assert "skills/brainstorming/scripts/start-server.sh" in supplemented
 
 
+def test_supplement_runtime_session_flow_source_paths_adds_sibling_scripts_for_script_repo() -> None:
+    repo_path = Path(__file__).resolve().parents[1] / ".repos" / "obra" / "superpowers"
+
+    supplemented = qa._supplement_runtime_implementation_source_paths(
+        ["skills/brainstorming/scripts/helper.js"],
+        repo_path=repo_path,
+    )
+
+    assert "skills/brainstorming/scripts/helper.js" in supplemented
+    assert "skills/brainstorming/scripts/server.cjs" in supplemented
+    assert "skills/brainstorming/scripts/start-server.sh" in supplemented
+
+
 def test_build_open_analysis_why_lines_backfills_distinct_path_hints_when_evidence_is_narrow() -> None:
     why_lines = qa._build_open_analysis_why_lines(
         evidence_blocks=[
@@ -1404,6 +1570,38 @@ def test_build_open_analysis_why_lines_backfills_distinct_path_hints_when_eviden
 
     assert any("websocket connection state" in line for line in why_lines)
     assert any("shell wrappers and the Node runtime" in line for line in why_lines)
+
+
+def test_build_flow_evidence_why_lines_backfills_runtime_path_hints_when_evidence_is_narrow() -> None:
+    why_lines = qa._build_flow_evidence_why_lines(
+        evidence_blocks=[
+            {
+                "file_path": "skills/brainstorming/scripts/helper.js",
+                "reason": "Vector retrieval result",
+                "snippet": "let ws = null;\nfunction websocketUrl() {\n  return 'ws://' + window.location.host;\n}\nwindow.sessionStorage.getItem('brainstorm-session-key')\n",
+            },
+        ],
+        source_paths=[
+            "skills/brainstorming/scripts/helper.js",
+            "skills/brainstorming/scripts/server.cjs",
+            "skills/brainstorming/scripts/start-server.sh",
+        ],
+    )
+
+    assert any(
+        "websocket connection state" in line
+        or "browser session storage coupling" in line
+        or "recovery bugs can hide" in line
+        for line in why_lines
+    )
+    assert any(
+        "port reuse" in line
+        or "companion recovery" in line
+        or "websocket session behavior" in line
+        or "runtime identity handling" in line
+        for line in why_lines
+    )
+    assert any("shell and Node entrypoints" in line or "shell wrappers and the Node runtime" in line for line in why_lines)
 
 
 def test_confidence_score_boosts_focused_flow_answers() -> None:
@@ -1568,6 +1766,31 @@ def test_build_workspace_mismatch_guard_answer_flags_missing_relationship_target
     assert "Switch to the repository" in answer
 
 
+def test_build_workspace_mismatch_guard_answer_flags_missing_runtime_workspace(tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+
+    answer = qa_types.build_workspace_mismatch_guard_answer(
+        question="How does the websocket session recovery work?",
+        repo_path=tmp_path,
+        source_paths=["README.md"],
+        evidence_blocks=[
+            {
+                "file_path": "README.md",
+                "reason": "Vector retrieval result",
+                "snippet": "project overview",
+            }
+        ],
+        call_chain_summary="",
+        repo_symbols=qa._repo_symbol_catalog(str(tmp_path.resolve())),
+        extract_identifier_terms=qa._extract_identifier_terms,
+    )
+
+    assert "does not appear to match the current workspace" in answer
+    assert "websocket/session recovery" in answer
+
+
 def test_answer_question_returns_workspace_mismatch_guard_before_model_call(monkeypatch, tmp_path: Path) -> None:
     app_dir = tmp_path / "app"
     app_dir.mkdir()
@@ -1604,6 +1827,51 @@ def test_answer_question_returns_workspace_mismatch_guard_before_model_call(monk
     result = qa.answer_question(
         index=fake_index,
         question="Which file fetches GitHub workflow runs and where are they summarized?",
+        config=config,
+        repo_path=tmp_path,
+    )
+
+    assert "does not appear to match the current workspace" in result.answer
+    assert result.sources == []
+    assert result.confidence_label == "Low confidence"
+
+
+def test_answer_question_returns_runtime_workspace_mismatch_guard_before_model_call(monkeypatch, tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "main.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+
+    config = AppConfig(
+        ollama_base_url="http://localhost:11434",
+        chat_model="qwen2.5:7b",
+        embedding_model="nomic-embed-text",
+        index_dir_name=".storage",
+        chunk_size=1200,
+        chunk_overlap=150,
+        top_k=8,
+    )
+    fake_index = FakeIndex(
+        [
+            FakeNode(
+                "README.md",
+                "project overview",
+                extension=".md",
+            )
+        ]
+    )
+
+    monkeypatch.setattr(qa, "_rewrite_question", lambda question, history, llm: question)
+    monkeypatch.setattr(qa, "ChatOllama", lambda **kwargs: object())
+
+    class FailPrompt:
+        def __or__(self, other):
+            raise AssertionError("LLM should not be invoked when workspace mismatch guard triggers")
+
+    monkeypatch.setattr(qa, "ANSWER_PROMPT", FailPrompt())
+
+    result = qa.answer_question(
+        index=fake_index,
+        question="How does the websocket session recovery work?",
         config=config,
         repo_path=tmp_path,
     )

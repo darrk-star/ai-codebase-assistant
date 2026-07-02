@@ -201,6 +201,58 @@ def test_render_message_content_keeps_user_messages_unchanged(monkeypatch) -> No
     assert "markdown" not in captured
 
 
+def test_build_search_explainer_describes_rewritten_query() -> None:
+    lines = ui._build_search_explainer("build_weekly_ci_digest writer output path")
+
+    assert lines[0].startswith("Started from your question")
+    assert "concrete code evidence" in lines[1]
+    assert lines[2] == "build_weekly_ci_digest writer output path"
+
+
+def test_evidence_bucket_label_prefers_direct_implementation() -> None:
+    label = ui._evidence_bucket_label(
+        "app/metrics.py defines `build_weekly_ci_digest()` and contains a call to `write_summary()`.",
+        "app/metrics.py",
+    )
+
+    assert label == "Direct implementation evidence"
+
+
+def test_evidence_bucket_label_detects_supporting_scripts() -> None:
+    label = ui._evidence_bucket_label(
+        "Sibling script supplement selected from the same runtime folder.",
+        "skills/brainstorming/scripts/start-server.sh",
+    )
+
+    assert label == "Supporting sibling script"
+
+
+def test_build_source_descriptors_adds_kind_labels() -> None:
+    descriptors = ui._build_source_descriptors(
+        [
+            "app/metrics.py",
+            "skills/brainstorming/scripts/start-server.sh",
+            "README.md",
+        ]
+    )
+
+    assert descriptors[0]["label"] == "Python source"
+    assert descriptors[1]["label"] == "Shell script"
+    assert descriptors[2]["label"] == "Documentation"
+
+
+def test_build_source_descriptors_deduplicates_sources() -> None:
+    descriptors = ui._build_source_descriptors(
+        [
+            "app/metrics.py",
+            "app/metrics.py",
+            "app/ui.py",
+        ]
+    )
+
+    assert [item["path"] for item in descriptors] == ["app/metrics.py", "app/ui.py"]
+
+
 def test_suggested_questions_cover_multiple_question_types() -> None:
     prompts = ui.DEFAULT_SUGGESTED_QUESTIONS
 
@@ -298,6 +350,25 @@ def test_save_workspace_persists_github_source_url(tmp_path: Path) -> None:
     assert st.session_state["workspaces"][repo_key]["source_url"] == "https://github.com/openai/codex"
 
 
+def test_get_workspace_does_not_auto_save_unsaved_repo(tmp_path: Path) -> None:
+    repo_path = tmp_path / "unsaved-repo"
+    repo_path.mkdir()
+    repo_key = str(repo_path.resolve())
+
+    st.session_state.clear()
+    st.session_state["workspaces"] = {}
+    st.session_state["workspace_order"] = []
+    st.session_state["active_repo_key"] = ""
+
+    workspace = ui._get_workspace(repo_path)
+
+    assert workspace["repo_path"] == repo_key
+    assert workspace["index"] is None
+    assert workspace["messages"] == []
+    assert repo_key not in st.session_state["workspaces"]
+    assert repo_key not in st.session_state["workspace_order"]
+
+
 def test_workspace_source_url_returns_github_input_for_github_repo() -> None:
     source_url = ui._workspace_source_url(
         {
@@ -372,10 +443,31 @@ def test_prepare_repo_for_indexing_clones_github_repo(monkeypatch, tmp_path: Pat
 
     monkeypatch.setattr(ui, "_run_git_command", fake_run_git_command)
 
-    resolved = ui._prepare_repo_for_indexing("https://github.com/openai/codex", repo_path, repo_spec)
+    resolved, force_rebuild = ui._prepare_repo_for_indexing("https://github.com/openai/codex", repo_path, repo_spec)
 
     assert resolved == repo_path
+    assert force_rebuild is True
     assert captured["command"] == ["git", "clone", "https://github.com/openai/codex.git", str(repo_path)]
+
+
+def test_prepare_repo_for_indexing_marks_existing_github_repo_for_rebuild_after_pull(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(ui, "CLONED_REPOS_ROOT", tmp_path / ".repos")
+    repo_path, repo_spec = ui._resolve_repo_input("https://github.com/openai/codex")
+    repo_path.mkdir(parents=True, exist_ok=True)
+    (repo_path / ".git").mkdir()
+    captured: dict[str, object] = {}
+
+    def fake_run_git_command(command: list[str], repo_input: str) -> None:
+        captured["command"] = command
+        captured["repo_input"] = repo_input
+
+    monkeypatch.setattr(ui, "_run_git_command", fake_run_git_command)
+
+    resolved, force_rebuild = ui._prepare_repo_for_indexing("https://github.com/openai/codex", repo_path, repo_spec)
+
+    assert resolved == repo_path
+    assert force_rebuild is True
+    assert captured["command"] == ["git", "-C", str(repo_path), "pull", "--ff-only"]
 
 
 def test_humanize_git_error_explains_timeout() -> None:
@@ -631,6 +723,39 @@ def test_queue_question_stores_pending_prompt_and_user_message(monkeypatch, tmp_
     assert st.session_state["workspaces"][repo_key]["messages"][0]["content"] == "Which file contains argparse?"
 
 
+def test_queue_question_keeps_other_repo_in_flight_state_isolated(monkeypatch, tmp_path: Path) -> None:
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    repo_a_key = str(repo_a.resolve())
+    repo_b_key = str(repo_b.resolve())
+    rerun_calls = {"count": 0}
+
+    st.session_state.clear()
+    st.session_state["workspaces"] = {
+        repo_a_key: {"repo_path": repo_a_key, "index": "index-a", "messages": [], "source_url": ""},
+        repo_b_key: {"repo_path": repo_b_key, "index": "index-b", "messages": [], "source_url": ""},
+    }
+    st.session_state["workspace_order"] = [repo_a_key, repo_b_key]
+    st.session_state["active_repo_key"] = repo_a_key
+    st.session_state["pending_question"] = ""
+    st.session_state["pending_repo_key"] = ""
+    st.session_state["question_in_flight"] = False
+    st.session_state["active_question_run_id"] = 0
+
+    monkeypatch.setattr(ui.st, "rerun", lambda: rerun_calls.__setitem__("count", rerun_calls["count"] + 1))
+
+    ui._queue_question("Question for repo A", repo_a)
+    ui._queue_question("Question for repo B", repo_b)
+
+    assert rerun_calls["count"] == 2
+    assert ui._question_busy_for_repo(repo_a) is True
+    assert ui._question_busy_for_repo(repo_b) is True
+    assert st.session_state["workspaces"][repo_a_key]["messages"][-1]["content"] == "Question for repo A"
+    assert st.session_state["workspaces"][repo_b_key]["messages"][-1]["content"] == "Question for repo B"
+
+
 def test_process_pending_question_consumes_matching_prompt(monkeypatch, tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     repo_path.mkdir()
@@ -730,6 +855,33 @@ def test_cancel_pending_question_clears_matching_repo(monkeypatch, tmp_path: Pat
     assert st.session_state["active_question_run_id"] == 6
 
 
+def test_cancel_pending_question_only_clears_matching_repo(monkeypatch, tmp_path: Path) -> None:
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    rerun_calls = {"count": 0}
+
+    st.session_state.clear()
+    st.session_state["workspaces"] = {}
+    st.session_state["workspace_order"] = []
+    st.session_state["active_repo_key"] = str(repo_a.resolve())
+    st.session_state["pending_question"] = ""
+    st.session_state["pending_repo_key"] = ""
+    st.session_state["question_in_flight"] = False
+    st.session_state["active_question_run_id"] = 0
+
+    monkeypatch.setattr(ui.st, "rerun", lambda: rerun_calls.__setitem__("count", rerun_calls["count"] + 1))
+
+    ui._queue_question("Question for repo A", repo_a)
+    ui._queue_question("Question for repo B", repo_b)
+    ui._cancel_pending_question(repo_b)
+
+    assert rerun_calls["count"] == 3
+    assert ui._question_busy_for_repo(repo_a) is True
+    assert ui._question_busy_for_repo(repo_b) is False
+
+
 def test_question_busy_for_repo_checks_matching_running_state(tmp_path: Path) -> None:
     repo_path = tmp_path / "repo"
     repo_path.mkdir()
@@ -737,14 +889,22 @@ def test_question_busy_for_repo_checks_matching_running_state(tmp_path: Path) ->
     other_repo.mkdir()
 
     st.session_state.clear()
-    st.session_state["pending_repo_key"] = str(repo_path.resolve())
-    st.session_state["question_in_flight"] = False
+    st.session_state["question_runs"] = {
+        str(repo_path.resolve()): {
+            "pending_question": "",
+            "question_in_flight": False,
+            "active_question_run_id": 0,
+        }
+    }
 
     assert ui._question_busy_for_repo(repo_path) is False
     assert ui._question_busy_for_repo(other_repo) is False
 
-    st.session_state["pending_repo_key"] = str(repo_path.resolve())
-    st.session_state["question_in_flight"] = True
+    st.session_state["question_runs"][str(repo_path.resolve())] = {
+        "pending_question": "How is the weekly digest built?",
+        "question_in_flight": True,
+        "active_question_run_id": 1,
+    }
 
     assert ui._question_busy_for_repo(repo_path) is True
     assert ui._question_busy_for_repo(other_repo) is False

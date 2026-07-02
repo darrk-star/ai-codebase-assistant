@@ -5,6 +5,7 @@ from pathlib import Path
 from app import main
 from app import qa
 from app.config import AppConfig
+from app import indexing
 from app.loaders import load_codebase_documents
 
 
@@ -253,3 +254,56 @@ def test_handle_question_prints_realistic_result(monkeypatch, capsys, tmp_path: 
 
     assert "Answer:" in output
     assert "- app/service.py" in output
+
+
+def test_build_or_load_index_rebuilds_when_repo_files_change(monkeypatch, tmp_path: Path) -> None:
+    repo_path = _make_sample_repo(tmp_path)
+    config = _base_config()
+    index_dir = config.resolve_index_dir(repo_path)
+
+    load_calls = {"count": 0}
+    build_calls = {"count": 0}
+
+    class FakeStorageContext:
+        @staticmethod
+        def from_defaults(persist_dir: str):
+            return {"persist_dir": persist_dir}
+
+    class FakeBuiltIndex:
+        def __init__(self) -> None:
+            self.storage_context = self
+
+        def persist(self, persist_dir: str) -> None:
+            build_calls["persist_dir"] = persist_dir
+
+    def fake_load_index_from_storage(storage_context):
+        load_calls["count"] += 1
+        return "loaded-index"
+
+    def fake_from_documents(documents):
+        build_calls["count"] += 1
+        return FakeBuiltIndex()
+
+    monkeypatch.setattr(indexing, "StorageContext", FakeStorageContext)
+    monkeypatch.setattr(indexing, "load_index_from_storage", fake_load_index_from_storage)
+    monkeypatch.setattr(indexing.VectorStoreIndex, "from_documents", staticmethod(fake_from_documents))
+    monkeypatch.setattr(indexing, "_configure_llama_index", lambda config: None)
+
+    first = indexing.build_or_load_index(repo_path=repo_path, config=config, rebuild=False)
+    assert isinstance(first, FakeBuiltIndex)
+    assert load_calls["count"] == 0
+    assert build_calls["count"] == 1
+    assert (index_dir / indexing.INDEX_STATE_FILE).exists()
+
+    (repo_path / "app" / "helpers.py").write_text(
+        "def compute_digest() -> str:\n    return 'digest-v2'\n",
+        encoding="utf-8",
+    )
+
+    second = indexing.build_or_load_index(repo_path=repo_path, config=config, rebuild=False)
+    assert isinstance(second, FakeBuiltIndex)
+    assert build_calls["count"] == 2
+
+    third = indexing.build_or_load_index(repo_path=repo_path, config=config, rebuild=False)
+    assert third == "loaded-index"
+    assert load_calls["count"] == 1

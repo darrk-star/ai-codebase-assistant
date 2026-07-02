@@ -223,6 +223,8 @@ def answer_question(
     )
     if classify_question_type(question, call_chain_summary) == "open_analysis":
         source_paths = _supplement_open_analysis_source_paths(source_paths, repo_path)
+    elif _is_runtime_implementation_question(question):
+        source_paths = _supplement_runtime_implementation_source_paths(source_paths, repo_path)
     evidence_blocks = _filter_evidence_for_question(
         evidence_blocks=evidence_blocks,
         question=question,
@@ -370,8 +372,13 @@ def _build_typed_answer(
     if question_type == "artifact_flow":
         if call_chain_summary:
             return ""
-        answer_line = "Answer: The retrieved implementation points to a repository flow for this artifact, but the full cross-file chain was not recovered exactly."
-        why_lines = _build_flow_evidence_why_lines(evidence_blocks)
+        answer_line = _build_runtime_flow_answer_line(question, source_paths, evidence_blocks)
+        if not answer_line:
+            answer_line = "Answer: The retrieved implementation points to a repository flow for this artifact, but the full cross-file chain was not recovered exactly."
+        why_lines = _build_flow_evidence_why_lines(
+            evidence_blocks=evidence_blocks,
+            source_paths=source_paths if _is_runtime_implementation_question(question) else None,
+        )
         if not why_lines:
             why_lines = [
                 "- The retrieved files are implementation files, but they do not expose a complete writer chain for this artifact.",
@@ -457,6 +464,65 @@ def _build_typed_answer(
             why_lines=why_lines,
             source_paths=source_paths,
         )
+
+    return ""
+
+
+def _build_runtime_flow_answer_line(
+    question: str,
+    source_paths: list[str],
+    evidence_blocks: list[dict[str, str]],
+) -> str:
+    if not _is_runtime_implementation_question(question):
+        return ""
+
+    evidence_paths = [
+        str(item.get("file_path", "")).replace("\\", "/")
+        for item in evidence_blocks
+        if str(item.get("file_path", "")).strip() and str(item.get("file_path", "")).strip() != "call-chain-summary"
+    ]
+    normalized_evidence_paths = [path.lower() for path in evidence_paths]
+    helper_path = next((path for path in evidence_paths if path.lower().endswith("helper.js")), "")
+    server_path = next((path for path in evidence_paths if path.lower().endswith("server.cjs")), "")
+    launcher_path = next(
+        (path for path in evidence_paths if any(path.lower().endswith(name) for name in ("start-server.sh", "stop-server.sh", ".cmd"))),
+        "",
+    )
+
+    if "websocket" in question.lower() and "session" in question.lower():
+        pieces: list[str] = []
+        if helper_path:
+            pieces.append(f"client-side reconnect state in `{helper_path}`")
+        if server_path:
+            pieces.append(f"server-side websocket/session handling in `{server_path}`")
+        if launcher_path:
+            pieces.append(f"restart orchestration in `{launcher_path}`")
+        if pieces:
+            if len(pieces) == 1:
+                joined = pieces[0]
+            elif len(pieces) == 2:
+                joined = f"{pieces[0]} and {pieces[1]}"
+            else:
+                joined = ", ".join(pieces[:-1]) + f", and {pieces[-1]}"
+            return f"Answer: Session recovery works through {joined}."
+
+    if any(token in question.lower() for token in ("startup", "shutdown", "restart", "lifecycle", "process")):
+        if launcher_path or server_path:
+            pieces = [part for part in [
+                f"shell-level process control in `{launcher_path}`" if launcher_path else "",
+                f"runtime coordination in `{server_path}`" if server_path else "",
+            ] if part]
+            if len(pieces) == 1:
+                joined = pieces[0]
+            else:
+                joined = " and ".join(pieces)
+            return f"Answer: This runtime flow is coordinated through {joined}."
+
+    has_helper = any(path.endswith("helper.js") for path in normalized_evidence_paths)
+    has_server = any(path.endswith("server.cjs") for path in normalized_evidence_paths)
+    has_launcher = any(path.endswith("start-server.sh") for path in normalized_evidence_paths)
+    if has_helper and has_server and has_launcher:
+        return "Answer: This runtime behavior is split across the browser helper, the websocket server, and the shell wrapper that manages server restarts."
 
     return ""
 
@@ -552,15 +618,33 @@ def _build_config_entity_location_answer(
 
 def _build_flow_evidence_why_lines(
     evidence_blocks: list[dict[str, str]],
+    source_paths: list[str] | None = None,
     limit: int = 3,
 ) -> list[str]:
     why_lines: list[str] = []
+    covered_paths: set[str] = set()
     for item in evidence_blocks[:limit]:
         file_path = str(item.get("file_path", "")).strip()
         if not file_path or file_path == "call-chain-summary":
             continue
         snippet = str(item.get("snippet", "")).strip()
         why_lines.append(_describe_flow_evidence(file_path, snippet))
+        covered_paths.add(file_path.replace("\\", "/").lower())
+
+    if source_paths:
+        for path in source_paths:
+            normalized = path.replace("\\", "/").lower()
+            if len(why_lines) >= limit:
+                break
+            if normalized in covered_paths:
+                continue
+            hint = _describe_runtime_implementation_path_hint(path)
+            if not hint:
+                continue
+            if any(hint == existing for existing in why_lines):
+                continue
+            why_lines.append(hint)
+            covered_paths.add(normalized)
     return why_lines
 
 
@@ -724,6 +808,17 @@ def _describe_open_analysis_path_hint(file_path: str) -> str:
     return ""
 
 
+def _describe_runtime_implementation_path_hint(file_path: str) -> str:
+    hint = _describe_open_analysis_path_hint(file_path)
+    if hint:
+        return hint
+
+    normalized = file_path.replace("\\", "/").lower()
+    if normalized.endswith((".js", ".cjs", ".mjs", ".ts", ".tsx", ".py", ".sh", ".cmd")):
+        return f"- `{file_path}` is another implementation file adjacent to the retrieved runtime path, so it may carry part of the flow."
+    return ""
+
+
 def _describe_relationship_evidence(
     file_path: str,
     snippet: str,
@@ -766,11 +861,27 @@ def _describe_relationship_evidence(
 
 def _describe_flow_evidence(file_path: str, snippet: str) -> str:
     condensed = " ".join(snippet.split())
+    snippet_lower = snippet.lower()
 
     writer_match = re.search(r"writes?\s+`?([A-Za-z0-9_./-]+)`?", snippet)
     output_path_match = re.search(r"output_path\s*=\s*['\"]([^'\"]+)['\"]", snippet)
     function_match = re.search(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet)
     call_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\(", snippet)
+
+    if any(
+        token in snippet_lower
+        for token in (
+            "websocket",
+            "sessionstorage",
+            "brainstorm-session-key",
+            "server.pid",
+            "brainstorm_port",
+            "brainstorm_token",
+            "nohup",
+            "node server.cjs",
+        )
+    ):
+        return _describe_open_analysis_evidence(file_path, snippet)
 
     if writer_match:
         output_path = writer_match.group(1)
@@ -812,6 +923,10 @@ def _describe_open_analysis_evidence(file_path: str, snippet: str) -> str:
         return f"- `{file_path}` falls back to a generic `unknown_failure` path when no rule matches, which suggests edge cases can collapse into a coarse bucket."
     if any(token in snippet for token in ("category_counts", "workflow_failures", "grouped:", "top_failed_workflows")):
         return f"- `{file_path}` aggregates workflow signals through in-memory counters and grouped summaries, concentrating the reporting logic in a small set of data structures."
+    normalized_path = file_path.replace("\\", "/").lower()
+    if normalized_path.endswith("/helper.js") or normalized_path.endswith("helper.js"):
+        if any(token in snippet_lower for token in ("server-started", "websocket", "sessionstorage", "brainstorm-session-key")):
+            return f"- `{file_path}` keeps websocket reconnect behavior and browser session storage coupling in one client helper, which narrows where recovery bugs can hide."
     if any(token in snippet_lower for token in ("port_file", "brainstorm_port", "token_file", "brainstorm_token", "cookie_name", "sessionstorage")):
         return f"- `{file_path}` coordinates session key, port reuse, and reconnect/auth state in one runtime module, so browser recovery and server identity are coupled here."
     if any(token in snippet_lower for token in ("server.pid", "pid_file", "nohup", "node server.cjs", "spawn(", "child_process", "kill \"$old_pid\"", "kill $old_pid", "brainstorm_owner_pid")):
@@ -1140,6 +1255,8 @@ def _filter_sources_for_question(
     if question_type == "entity_location":
         return _prioritize_entity_location_paths(deduped, question)
 
+    runtime_implementation_question = is_flow_question(question_lower) and _is_runtime_implementation_question(question_lower)
+
     if not is_flow_question(question) and not call_chain_summary:
         if question_type != "open_analysis":
             return deduped
@@ -1152,6 +1269,11 @@ def _filter_sources_for_question(
             continue
         if normalized.startswith("tests/") or "/tests/" in normalized:
             continue
+        if runtime_implementation_question:
+            if not _is_open_analysis_implementation_path(normalized):
+                continue
+            filtered.append(path)
+            continue
         if question_type == "open_analysis" and not is_flow_question(question_lower):
             if not _is_open_analysis_implementation_path(normalized):
                 continue
@@ -1160,6 +1282,9 @@ def _filter_sources_for_question(
         if chain_lower and normalized not in chain_lower:
             continue
         filtered.append(path)
+
+    if runtime_implementation_question:
+        return filtered[:5]
 
     if question_type == "open_analysis" and not is_flow_question(question_lower):
         ranked = _prioritize_open_analysis_paths(filtered)
@@ -1175,6 +1300,7 @@ def _filter_evidence_for_question(
     question_lower = question.lower()
     question_type = classify_question_type(question, "")
     is_flow = is_flow_question(question_lower)
+    runtime_implementation_question = is_flow and _is_runtime_implementation_question(question_lower)
     if question_type == "relationship_trace":
         return _prioritize_relationship_evidence(evidence_blocks, question)
     if question_type == "entity_location":
@@ -1187,6 +1313,11 @@ def _filter_evidence_for_question(
     for item in evidence_blocks:
         file_path = str(item.get("file_path", "")).replace("\\", "/").lower()
         snippet = str(item.get("snippet", "")).lower()
+        if runtime_implementation_question:
+            if not _is_open_analysis_implementation_path(file_path):
+                continue
+            filtered.append(item)
+            continue
         if question_type == "open_analysis" and not is_flow:
             if not _is_open_analysis_implementation_path(file_path):
                 continue
@@ -1200,6 +1331,9 @@ def _filter_evidence_for_question(
             if any(token in snippet for token in ("summarize_pull_requests", "summarize_workflow_runs")):
                 continue
             filtered.append(item)
+
+    if runtime_implementation_question:
+        return filtered[:5]
 
     if question_type == "open_analysis" and not is_flow:
         ranked = _prioritize_open_analysis_evidence(filtered)
@@ -1254,6 +1388,14 @@ def _supplement_open_analysis_source_paths(
             supplemented.append(path)
 
     return supplemented[:limit]
+
+
+def _supplement_runtime_implementation_source_paths(
+    source_paths: list[str],
+    repo_path: Path,
+    limit: int = 4,
+) -> list[str]:
+    return _supplement_open_analysis_source_paths(source_paths, repo_path, limit=limit)
 
 
 def _prioritize_entity_location_paths(paths: list[str], question: str, limit: int = 2) -> list[str]:
@@ -1490,6 +1632,40 @@ def _is_open_analysis_noise_path(path: str) -> bool:
     if file_name in {"plugin.json", "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}:
         return True
     return False
+
+
+def _is_runtime_implementation_question(question: str) -> bool:
+    question_lower = question.lower()
+    if not any(token in question_lower for token in ("how", "flow", "work", "works", "working", "interaction", "recovery")):
+        return False
+    strong_runtime_tokens = (
+        "websocket",
+        "session",
+        "reconnect",
+        "recovery",
+        "auth",
+        "token",
+        "startup",
+        "shutdown",
+        "restart",
+        "lifecycle",
+        "port",
+        "server.pid",
+        "socket",
+    )
+    contextual_tokens = (
+        "runtime",
+        "server",
+        "client",
+        "process",
+        "state",
+    )
+    if any(token in question_lower for token in strong_runtime_tokens):
+        return True
+    return (
+        any(token in question_lower for token in contextual_tokens)
+        and any(token in question_lower for token in ("websocket", "session", "reconnect", "auth", "token", "startup", "shutdown"))
+    )
 
 
 def _is_open_analysis_implementation_path(path: str) -> bool:

@@ -148,8 +148,8 @@ def main() -> None:
             if st.button("Build / Load Index", use_container_width=True, type="primary", disabled=not repo_ready):
                 try:
                     with st.spinner("Preparing index..."):
-                        repo_path = _prepare_repo_for_indexing(repo_input, repo_path, repo_spec)
-                        index = build_or_load_index(repo_path=repo_path, config=config, rebuild=rebuild)
+                        repo_path, force_rebuild = _prepare_repo_for_indexing(repo_input, repo_path, repo_spec)
+                        index = build_or_load_index(repo_path=repo_path, config=config, rebuild=rebuild or force_rebuild)
                     _save_workspace(repo_path=repo_path, index=index, source_url=_workspace_source_url(repo_spec))
                     _queue_repo_input_value(str(repo_path))
                     st.success(f"Index ready at: {config.resolve_index_dir(repo_path)}")
@@ -259,6 +259,7 @@ def _init_session_state() -> None:
     st.session_state.setdefault("workspaces", {})
     st.session_state.setdefault("workspace_order", [])
     st.session_state.setdefault("active_repo_key", "")
+    st.session_state.setdefault("question_runs", {})
     st.session_state.setdefault("pending_question", "")
     st.session_state.setdefault("pending_repo_key", "")
     st.session_state.setdefault("question_in_flight", False)
@@ -324,21 +325,32 @@ def _render_messages(messages: list[dict[str, object]]) -> None:
 
             if search_question:
                 with st.expander("How the assistant searched"):
-                    st.caption("Rewritten retrieval question")
-                    st.code(search_question)
+                    search_lines = _build_search_explainer(search_question)
+                    st.caption(search_lines[0])
+                    st.caption(search_lines[1])
+                    st.markdown("**Retrieval query**")
+                    st.code(search_lines[2])
 
             if evidence:
                 with st.expander("Why these files were selected"):
                     for item in evidence:
-                        st.markdown(f"**{item['file_path']}**")
-                        st.caption(item["reason"])
-                        st.code(item["snippet"])
+                        file_path = str(item.get("file_path", "")).strip()
+                        reason = str(item.get("reason", "")).strip()
+                        snippet = str(item.get("snippet", "")).strip()
+                        st.markdown(f"**{file_path}**")
+                        st.caption(_evidence_bucket_label(reason, file_path))
+                        if reason:
+                            st.write(reason)
+                        if snippet:
+                            st.code(snippet)
 
             sources = message.get("sources") or []
             if sources:
                 with st.expander("Sources"):
-                    for source in sources:
-                        st.code(source)
+                    st.caption("These are the repository paths the final answer cited directly.")
+                    for descriptor in _build_source_descriptors(sources):
+                        st.markdown(f"**{descriptor['path']}**")
+                        st.caption(descriptor["label"])
 
 
 def _render_message_content(content: str, role: str) -> None:
@@ -349,6 +361,81 @@ def _render_message_content(content: str, role: str) -> None:
     body = re.split(r"\n\s*Sources:\s*\n", content, maxsplit=1)[0].strip()
     body = body.replace("\nWhy:\n", "\n\nWhy:\n\n")
     st.markdown(body)
+
+
+def _build_search_explainer(search_question: str) -> tuple[str, str, str]:
+    cleaned = search_question.strip()
+    return (
+        "Started from your question, then rewrote it into a repository search query.",
+        "The rewritten query biases retrieval toward concrete code evidence such as definitions, calls, branches, and runtime behavior.",
+        cleaned,
+    )
+
+
+def _evidence_bucket_label(reason: str, file_path: str) -> str:
+    reason_lower = reason.lower()
+    normalized_path = file_path.lower()
+    if any(
+        token in reason_lower
+        for token in ("sibling script", "supplement", "same runtime folder", "companion script")
+    ):
+        return "Supporting sibling script"
+    if reason_lower == "cross-file relationship summary":
+        return "Cross-file relationship summary"
+    if any(token in reason_lower for token in ("vector retrieval", "semantic", "keyword-based code match")):
+        return "Retrieval match"
+    if any(
+        token in reason_lower
+        for token in (
+            "direct implementation evidence",
+            "implementation",
+            "defines `",
+            "contains a call",
+            "exports `",
+            "control-flow",
+            "runtime behavior",
+            "entry point",
+            "entrypoint",
+            "startup and shutdown",
+        )
+    ):
+        return "Direct implementation evidence"
+    if normalized_path.endswith((".sh", ".cmd", ".bat")):
+        return "Runtime script evidence"
+    if normalized_path.endswith((".js", ".cjs", ".mjs", ".ts", ".tsx", ".py")):
+        return "Relevant code evidence"
+    if normalized_path.endswith((".md", ".rst")):
+        return "Documentation context"
+    return "Relevant repository evidence"
+
+
+def _build_source_descriptors(sources: list[str]) -> list[dict[str, str]]:
+    descriptors: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_source in sources:
+        source = str(raw_source).strip()
+        if not source or source in seen:
+            continue
+        seen.add(source)
+        descriptors.append({"path": source, "label": _source_kind_label(source)})
+    return descriptors
+
+
+def _source_kind_label(path: str) -> str:
+    normalized = path.lower()
+    if normalized.endswith(".py"):
+        return "Python source"
+    if normalized.endswith((".js", ".cjs", ".mjs", ".ts", ".tsx")):
+        return "JavaScript / TypeScript source"
+    if normalized.endswith((".sh", ".bash")):
+        return "Shell script"
+    if normalized.endswith((".cmd", ".bat", ".ps1")):
+        return "Command script"
+    if normalized.endswith((".md", ".rst")) or normalized.endswith(("readme", "readme.md")):
+        return "Documentation"
+    if normalized.endswith((".json", ".toml", ".yaml", ".yml", ".ini", ".env")):
+        return "Configuration / metadata"
+    return "Repository file"
 
 
 @lru_cache(maxsize=16)
@@ -800,19 +887,21 @@ def _repo_key(repo_path: Path) -> str:
     return str(repo_path.resolve())
 
 
+def _new_workspace(repo_path: Path) -> dict[str, object]:
+    repo_key = _repo_key(repo_path)
+    return {
+        "repo_path": repo_key,
+        "index": None,
+        "messages": [],
+        "source_url": "",
+    }
+
+
 def _get_workspace(repo_path: Path) -> dict[str, object]:
     repo_key = _repo_key(repo_path)
     workspace = st.session_state["workspaces"].get(repo_key)
     if workspace is None:
-        workspace = {
-            "repo_path": repo_key,
-            "index": None,
-            "messages": [],
-            "source_url": "",
-        }
-        st.session_state["workspaces"][repo_key] = workspace
-        if repo_key not in st.session_state["workspace_order"]:
-            st.session_state["workspace_order"].append(repo_key)
+        workspace = _new_workspace(repo_path)
     workspace.setdefault("source_url", "")
     return workspace
 
@@ -858,8 +947,47 @@ def _infer_github_source_url(repo_path: Path) -> str:
     return f"https://github.com/{owner}/{repo}"
 
 
+def _question_run_defaults() -> dict[str, object]:
+    return {
+        "pending_question": "",
+        "question_in_flight": False,
+        "active_question_run_id": 0,
+    }
+
+
+def _question_runs_store() -> dict[str, dict[str, object]]:
+    store = st.session_state.setdefault("question_runs", {})
+    legacy_repo_key = str(st.session_state.get("pending_repo_key", "")).strip()
+    if legacy_repo_key and not store:
+        store[legacy_repo_key] = {
+            "pending_question": st.session_state.get("pending_question", ""),
+            "question_in_flight": bool(st.session_state.get("question_in_flight", False)),
+            "active_question_run_id": int(st.session_state.get("active_question_run_id", 0)),
+        }
+    return store
+
+
+def _question_run_state(repo_path: Path) -> dict[str, object]:
+    repo_key = _repo_key(repo_path)
+    store = _question_runs_store()
+    state = store.get(repo_key)
+    if state is None:
+        state = _question_run_defaults()
+        store[repo_key] = state
+    return state
+
+
+def _sync_legacy_question_state(repo_path: Path) -> None:
+    state = _question_run_state(repo_path)
+    st.session_state["pending_question"] = str(state.get("pending_question", ""))
+    st.session_state["pending_repo_key"] = _repo_key(repo_path) if state.get("question_in_flight") else ""
+    st.session_state["question_in_flight"] = bool(state.get("question_in_flight", False))
+    st.session_state["active_question_run_id"] = int(state.get("active_question_run_id", 0))
+
+
 def _question_busy_for_repo(repo_path: Path) -> bool:
-    return bool(st.session_state.get("question_in_flight")) and st.session_state.get("pending_repo_key", "") == _repo_key(repo_path)
+    state = _question_run_state(repo_path)
+    return bool(state.get("question_in_flight", False))
 
 
 def _queue_question(question: str, repo_path: Path) -> None:
@@ -874,11 +1002,14 @@ def _queue_question(question: str, repo_path: Path) -> None:
             "content": cleaned_question,
         }
     )
+    if _repo_key(repo_path) not in st.session_state["workspace_order"]:
+        st.session_state["workspace_order"].append(_repo_key(repo_path))
     st.session_state["workspaces"][_repo_key(repo_path)] = workspace
-    st.session_state["pending_question"] = cleaned_question
-    st.session_state["pending_repo_key"] = _repo_key(repo_path)
-    st.session_state["question_in_flight"] = True
-    st.session_state["active_question_run_id"] = st.session_state.get("active_question_run_id", 0) + 1
+    state = _question_run_state(repo_path)
+    state["pending_question"] = cleaned_question
+    state["question_in_flight"] = True
+    state["active_question_run_id"] = int(state.get("active_question_run_id", 0)) + 1
+    _sync_legacy_question_state(repo_path)
     st.rerun()
 
 
@@ -886,10 +1017,11 @@ def _cancel_pending_question(repo_path: Path) -> None:
     if not _question_busy_for_repo(repo_path):
         return
 
-    st.session_state["pending_question"] = ""
-    st.session_state["pending_repo_key"] = ""
-    st.session_state["question_in_flight"] = False
-    st.session_state["active_question_run_id"] = st.session_state.get("active_question_run_id", 0) + 1
+    state = _question_run_state(repo_path)
+    state["pending_question"] = ""
+    state["question_in_flight"] = False
+    state["active_question_run_id"] = int(state.get("active_question_run_id", 0)) + 1
+    _sync_legacy_question_state(repo_path)
     st.rerun()
 
 
@@ -899,22 +1031,22 @@ def _process_pending_question(
     config: AppConfig,
     thinking_placeholder: object | None = None,
 ) -> None:
-    pending_question = st.session_state.get("pending_question", "").strip()
-    pending_repo_key = st.session_state.get("pending_repo_key", "")
-
-    if not pending_question or pending_repo_key != _repo_key(repo_path):
+    state = _question_run_state(repo_path)
+    pending_question = str(state.get("pending_question", "")).strip()
+    if not pending_question:
         return
-    if not st.session_state.get("question_in_flight"):
+    if not state.get("question_in_flight"):
         return
 
-    run_id = st.session_state.get("active_question_run_id", 0)
+    run_id = int(state.get("active_question_run_id", 0))
     try:
         _submit_suggested_question(pending_question, workspace, repo_path, config, run_id, thinking_placeholder)
     finally:
-        if st.session_state.get("active_question_run_id", 0) == run_id:
-            st.session_state["pending_question"] = ""
-            st.session_state["pending_repo_key"] = ""
-            st.session_state["question_in_flight"] = False
+        current_state = _question_run_state(repo_path)
+        if int(current_state.get("active_question_run_id", 0)) == run_id:
+            current_state["pending_question"] = ""
+            current_state["question_in_flight"] = False
+        _sync_legacy_question_state(repo_path)
 
 
 def _submit_suggested_question(
@@ -993,11 +1125,8 @@ def _submit_suggested_question(
 def _question_run_canceled(repo_path: Path, run_id: int | None) -> bool:
     if run_id is None:
         return False
-    return (
-        st.session_state.get("active_question_run_id", 0) != run_id
-        or st.session_state.get("pending_repo_key", "") != _repo_key(repo_path)
-        or not st.session_state.get("question_in_flight", False)
-    )
+    state = _question_run_state(repo_path)
+    return int(state.get("active_question_run_id", 0)) != run_id or not bool(state.get("question_in_flight", False))
 
 
 def _handle_workspace_change() -> None:
@@ -1062,23 +1191,26 @@ def _clone_target_dir(owner: str, repo: str) -> Path:
     return (CLONED_REPOS_ROOT / owner / repo).resolve()
 
 
-def _prepare_repo_for_indexing(repo_input: str, repo_path: Path, repo_spec: dict[str, str]) -> Path:
+def _prepare_repo_for_indexing(repo_input: str, repo_path: Path, repo_spec: dict[str, str]) -> tuple[Path, bool]:
     if repo_spec["kind"] != "github_url":
-        return repo_path
+        return repo_path, False
 
     clone_url = repo_spec["clone_url"]
     repo_path.parent.mkdir(parents=True, exist_ok=True)
+    force_rebuild = False
     if (repo_path / ".git").exists():
         _run_git_command(["git", "-C", str(repo_path), "pull", "--ff-only"], repo_input)
+        force_rebuild = True
     elif repo_path.exists() and any(repo_path.iterdir()):
         raise RuntimeError(f"Clone target already exists and is not an empty git repository: {repo_path}")
     else:
         _run_git_command(["git", "clone", clone_url, str(repo_path)], repo_input)
+        force_rebuild = True
 
     valid, message = _validate_repo_path(repo_path)
     if not valid:
         raise RuntimeError(message)
-    return repo_path
+    return repo_path, force_rebuild
 
 
 def _run_git_command(command: list[str], repo_input: str) -> None:

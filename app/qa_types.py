@@ -4,6 +4,18 @@ from pathlib import Path
 import re
 from typing import Callable
 
+IGNORED_RUNTIME_GUARD_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    ".storage",
+}
+
 
 def is_flow_question(text: str) -> bool:
     lowered = text.lower()
@@ -16,6 +28,11 @@ def classify_question_type(question: str, call_chain_summary: str) -> str:
         return "artifact_flow"
     if is_flow_question(question_lower):
         return "artifact_flow"
+    if (
+        (" call " in f" {question_lower} " or " calls " in f" {question_lower} " or question_lower.startswith("call "))
+        and any(token in question_lower for token in ("where is", "where are", "defined", "definition"))
+    ):
+        return "relationship_trace"
     if any(
         token in question_lower
         for token in ("what calls", "called by", "across files", "interact", "interaction", "relationship")
@@ -96,6 +113,44 @@ def source_path_mentions_identifier(source_paths: list[str], identifier: str) ->
     return any(normalized in path.replace("\\", "/").lower() for path in source_paths)
 
 
+def runtime_guard_targets(question: str) -> tuple[list[str], str]:
+    question_lower = question.lower()
+    if any(token in question_lower for token in ("websocket", "session", "reconnect", "recovery", "socket")):
+        return ["websocket", "session", "reconnect", "recovery", "socket"], "websocket/session recovery"
+    if any(token in question_lower for token in ("startup", "shutdown", "restart", "lifecycle", "server.pid", "pid")):
+        return ["startup", "shutdown", "restart", "lifecycle", "server.pid", "pid", "port"], "runtime lifecycle"
+    if any(token in question_lower for token in ("auth", "token")):
+        return ["auth", "token", "session"], "runtime auth/token handling"
+    return [], ""
+
+
+def repo_contains_runtime_signal(repo_path: Path, tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+
+    token_set = tuple(token.lower() for token in tokens)
+    for path in repo_path.rglob("*"):
+        if any(part in IGNORED_RUNTIME_GUARD_DIRS for part in path.parts):
+            continue
+        if path.is_dir():
+            continue
+        normalized_path = path.as_posix().lower()
+        if any(token in normalized_path for token in token_set):
+            return True
+        if path.suffix.lower() not in {".py", ".js", ".jsx", ".ts", ".tsx", ".cjs", ".mjs", ".sh", ".cmd", ".bat", ".ps1"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        text_lower = text.lower()
+        if any(token in text_lower for token in token_set):
+            return True
+    return False
+
+
 def build_workspace_mismatch_guard_answer(
     question: str,
     repo_path: Path,
@@ -108,6 +163,8 @@ def build_workspace_mismatch_guard_answer(
     question_type = classify_question_type(question, call_chain_summary)
     if question_type == "relationship_trace":
         target_identifiers = guard_target_identifiers(question, extract_identifier_terms)
+        runtime_tokens: list[str] = []
+        runtime_label = ""
     elif question_type == "entity_location" and is_fetch_summary_location_query(question):
         target_identifiers = list(
             dict.fromkeys(
@@ -115,28 +172,56 @@ def build_workspace_mismatch_guard_answer(
                 + ["fetch_workflow_runs", "summarize_workflow_runs"]
             )
         )
+        runtime_tokens = []
+        runtime_label = ""
+    elif question_type == "artifact_flow":
+        target_identifiers = []
+        runtime_tokens, runtime_label = runtime_guard_targets(question)
+        if not runtime_tokens:
+            return ""
     else:
         return ""
 
-    if not target_identifiers:
+    if not target_identifiers and not runtime_tokens:
         return ""
     if call_chain_summary.strip():
         return ""
-    if any(evidence_mentions_identifier(evidence_blocks, identifier) for identifier in target_identifiers):
+    if target_identifiers:
+        if any(evidence_mentions_identifier(evidence_blocks, identifier) for identifier in target_identifiers):
+            return ""
+        if any(source_path_mentions_identifier(source_paths, identifier) for identifier in target_identifiers):
+            return ""
+        if any(identifier in repo_symbols for identifier in target_identifiers):
+            return ""
+
+        joined_targets = ", ".join(f"`{identifier}`" for identifier in target_identifiers[:3])
+        answer_line = (
+            f"Answer: This question does not appear to match the current workspace `{repo_path.name}`. "
+            f"I could not find {joined_targets} in this repository."
+        )
+        why_lines = [
+            f"- I checked the current repository for definitions, call sites, and imports tied to {joined_targets}, but did not find them.",
+            "- This usually means the wrong workspace is selected, the GitHub import resolved to a different repository, or the index is stale.",
+            "- Switch to the repository that should contain those implementation targets, or rebuild the current index before asking again.",
+        ]
+        return format_typed_answer(answer_line=answer_line, why_lines=why_lines, source_paths=[])
+
+    if any(evidence_mentions_identifier(evidence_blocks, token) for token in runtime_tokens):
         return ""
-    if any(source_path_mentions_identifier(source_paths, identifier) for identifier in target_identifiers):
+    if any(source_path_mentions_identifier(source_paths, token) for token in runtime_tokens):
         return ""
-    if any(identifier in repo_symbols for identifier in target_identifiers):
+    if any(token in symbol for token in runtime_tokens for symbol in repo_symbols):
+        return ""
+    if repo_contains_runtime_signal(repo_path, runtime_tokens):
         return ""
 
-    joined_targets = ", ".join(f"`{identifier}`" for identifier in target_identifiers[:3])
     answer_line = (
         f"Answer: This question does not appear to match the current workspace `{repo_path.name}`. "
-        f"I could not find {joined_targets} in this repository."
+        f"I could not find clear {runtime_label} implementation signals in this repository."
     )
     why_lines = [
-        f"- I checked the current repository for definitions, call sites, and imports tied to {joined_targets}, but did not find them.",
+        f"- I checked the current repository for filenames, implementation snippets, and retrieved evidence tied to {runtime_label}, but did not find them.",
         "- This usually means the wrong workspace is selected, the GitHub import resolved to a different repository, or the index is stale.",
-        "- Switch to the repository that should contain those implementation targets, or rebuild the current index before asking again.",
+        "- Switch to the repository that should contain that runtime implementation, or rebuild the current index before asking again.",
     ]
     return format_typed_answer(answer_line=answer_line, why_lines=why_lines, source_paths=[])
