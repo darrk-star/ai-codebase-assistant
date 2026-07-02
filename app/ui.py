@@ -1056,7 +1056,7 @@ def _submit_suggested_question(
     config: AppConfig,
     run_id: int | None = None,
     thinking_placeholder: object | None = None,
-) -> None:
+    ) -> None:
     if workspace["index"] is None:
         workspace["messages"].append(
             {
@@ -1076,9 +1076,14 @@ def _submit_suggested_question(
         st.rerun()
         return
 
+    if _question_run_canceled(repo_path, run_id):
+        return
+
     spinner_host = thinking_placeholder if thinking_placeholder is not None else st
     with spinner_host.spinner("Thinking..."):
         try:
+            if _question_run_canceled(repo_path, run_id):
+                return
             result = answer_question(
                 index=workspace["index"],
                 question=question,
@@ -1126,7 +1131,21 @@ def _question_run_canceled(repo_path: Path, run_id: int | None) -> bool:
     if run_id is None:
         return False
     state = _question_run_state(repo_path)
-    return int(state.get("active_question_run_id", 0)) != run_id or not bool(state.get("question_in_flight", False))
+    if int(state.get("active_question_run_id", 0)) != run_id or not bool(state.get("question_in_flight", False)):
+        return True
+
+    legacy_run_id = int(st.session_state.get("active_question_run_id", 0))
+    legacy_in_flight = bool(st.session_state.get("question_in_flight", False))
+    legacy_repo_key = str(st.session_state.get("pending_repo_key", "")).strip()
+    active_repo_key = str(st.session_state.get("active_repo_key", "")).strip()
+    current_repo_key = _repo_key(repo_path)
+    legacy_targets_current_repo = legacy_repo_key == current_repo_key or (
+        not legacy_repo_key and active_repo_key == current_repo_key
+    )
+    if legacy_targets_current_repo and (legacy_run_id != run_id or not legacy_in_flight):
+        return True
+
+    return False
 
 
 def _handle_workspace_change() -> None:

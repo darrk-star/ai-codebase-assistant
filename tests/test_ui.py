@@ -966,3 +966,64 @@ def test_submit_suggested_question_drops_late_answer_after_cancel(monkeypatch, t
     )
 
     assert len(workspace["messages"]) == 1
+
+
+def test_submit_suggested_question_skips_answer_call_when_run_already_canceled(monkeypatch, tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    repo_key = str(repo_path.resolve())
+    workspace = {
+        "repo_path": repo_key,
+        "index": "fake-index",
+        "messages": [{"role": "user", "content": "Where is the Ollama base URL configured?"}],
+        "source_url": "",
+    }
+
+    st.session_state.clear()
+    st.session_state["workspaces"] = {repo_key: workspace}
+    st.session_state["workspace_order"] = [repo_key]
+    st.session_state["active_repo_key"] = repo_key
+    st.session_state["question_runs"] = {
+        repo_key: {
+            "pending_question": "",
+            "question_in_flight": False,
+            "active_question_run_id": 12,
+        }
+    }
+
+    class FakeSpinner:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(ui.st, "spinner", lambda _: FakeSpinner())
+    monkeypatch.setattr(ui.st, "rerun", lambda: None)
+
+    calls = {"count": 0}
+
+    def fake_answer_question(**kwargs):
+        calls["count"] += 1
+        return SimpleNamespace(
+            answer="Answer that should never be produced",
+            sources=["app/config.py"],
+            search_question="Where is the Ollama base URL configured?",
+            evidence=[],
+            confidence_label="High confidence",
+            confidence_score=90,
+            risk_note="Focused evidence.",
+        )
+
+    monkeypatch.setattr(ui, "answer_question", fake_answer_question)
+
+    ui._submit_suggested_question(
+        question="Where is the Ollama base URL configured?",
+        workspace=workspace,
+        repo_path=repo_path,
+        config=_base_config(),
+        run_id=11,
+    )
+
+    assert len(workspace["messages"]) == 1
+    assert calls["count"] == 0

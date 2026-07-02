@@ -8,7 +8,7 @@ from llama_index.core import Settings, StorageContext, VectorStoreIndex, load_in
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.ollama import OllamaEmbedding
 
-from app.config import AppConfig
+from app.config import AppConfig, DEFAULT_EXTENSIONS
 from app.loaders import IGNORED_DIR_NAMES
 from app.loaders import load_codebase_documents
 
@@ -55,6 +55,8 @@ def _repo_state(repo_path: Path) -> dict[str, object]:
         if not path.is_file():
             continue
         if any(part in IGNORED_DIR_NAMES for part in path.parts):
+            continue
+        if path.suffix.lower() not in DEFAULT_EXTENSIONS:
             continue
         try:
             stat = path.stat()

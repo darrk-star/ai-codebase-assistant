@@ -307,3 +307,50 @@ def test_build_or_load_index_rebuilds_when_repo_files_change(monkeypatch, tmp_pa
     third = indexing.build_or_load_index(repo_path=repo_path, config=config, rebuild=False)
     assert third == "loaded-index"
     assert load_calls["count"] == 1
+
+
+def test_build_or_load_index_ignores_non_indexed_file_changes(monkeypatch, tmp_path: Path) -> None:
+    repo_path = _make_sample_repo(tmp_path)
+    config = _base_config()
+    index_dir = config.resolve_index_dir(repo_path)
+
+    load_calls = {"count": 0}
+    build_calls = {"count": 0}
+
+    class FakeStorageContext:
+        @staticmethod
+        def from_defaults(persist_dir: str):
+            return {"persist_dir": persist_dir}
+
+    class FakeBuiltIndex:
+        def __init__(self) -> None:
+            self.storage_context = self
+
+        def persist(self, persist_dir: str) -> None:
+            build_calls["persist_dir"] = persist_dir
+
+    def fake_load_index_from_storage(storage_context):
+        load_calls["count"] += 1
+        return "loaded-index"
+
+    def fake_from_documents(documents):
+        build_calls["count"] += 1
+        return FakeBuiltIndex()
+
+    monkeypatch.setattr(indexing, "StorageContext", FakeStorageContext)
+    monkeypatch.setattr(indexing, "load_index_from_storage", fake_load_index_from_storage)
+    monkeypatch.setattr(indexing.VectorStoreIndex, "from_documents", staticmethod(fake_from_documents))
+    monkeypatch.setattr(indexing, "_configure_llama_index", lambda config: None)
+
+    first = indexing.build_or_load_index(repo_path=repo_path, config=config, rebuild=False)
+    assert isinstance(first, FakeBuiltIndex)
+    assert build_calls["count"] == 1
+    assert load_calls["count"] == 0
+    assert (index_dir / indexing.INDEX_STATE_FILE).exists()
+
+    (repo_path / "diagram.png").write_bytes(b"fake-image")
+
+    second = indexing.build_or_load_index(repo_path=repo_path, config=config, rebuild=False)
+    assert second == "loaded-index"
+    assert build_calls["count"] == 1
+    assert load_calls["count"] == 1
